@@ -1,0 +1,149 @@
+{
+  "name": "softcode-ai",
+  "displayName": "SoftCode",
+  "description": "AI-powered coding assistant built into VS Code – understand, navigate, debug, and improve your codebase.",
+  "version": "0.1.0",
+  "publisher": "softcode",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": ["ai", "claude", "anthropic", "coding assistant", "codebase"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "softcodeAI.openChat",
+        "title": "Open Chat",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.explainSelection",
+        "title": "Explain Selected Code",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.fixError",
+        "title": "Fix This Error",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.refactorFile",
+        "title": "Refactor Current File",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.generateTests",
+        "title": "Generate Tests",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.searchWorkspace",
+        "title": "Search Workspace",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.clearConversation",
+        "title": "Clear Conversation",
+        "category": "SoftCode AI"
+      },
+      {
+        "command": "softcodeAI.setApiKey",
+        "title": "Configure API Key",
+        "category": "SoftCode AI"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "softcode-ai-sidebar",
+          "title": "SoftCode AI",
+          "icon": "$(robot)"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "softcode-ai",
+          "title": "SoftCode AI",
+          "icon": "$(robot)"
+        }
+      ]
+    },
+    "views": {
+      "softcode-ai-sidebar": [
+        {
+          "type": "webview",
+          "id": "softcodeAI.chatView",
+          "name": "SoftCode AI"
+        }
+      ],
+      "softcode-ai": [
+        {
+          "type": "webview",
+          "id": "softcodeAI.chatViewRight",
+          "name": "SoftCode AI"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "softcodeAI.explainSelection",
+          "when": "editorHasSelection",
+          "group": "softcode@1"
+        },
+        {
+          "command": "softcodeAI.fixError",
+          "group": "softcode@2"
+        },
+        {
+          "command": "softcodeAI.generateTests",
+          "group": "softcode@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "softcodeAI.explainSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "softcodeAI.explainSelection",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "softcodeAI.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ]
+  },
+  "scripts": {
+    "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
+    "build:webview": "cd webview && npm run build",
+    "build": "npm run build:ext && npm run build:webview",
+    "watch:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
+    "watch:webview": "cd webview && npm run dev",
+    "compile": "tsc --noEmit",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.36.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}
