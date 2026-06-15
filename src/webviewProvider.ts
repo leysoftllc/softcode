@@ -6,6 +6,7 @@ import { ContextBuilder, ConversationMessage, RequestContext, Mode } from './con
 import { WorkspaceIndexer } from './workspaceIndexer';
 import { UsageTracker } from './usageTracker';
 import { PatchManager } from './patchManager';
+import { SessionManager, SavedSession } from './sessionManager';
 
 type ContextScope = 'file' | 'selection' | 'workspace' | 'search';
 
@@ -18,14 +19,19 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
     private readonly indexer        = new WorkspaceIndexer();
     private readonly contextBuilder = new ContextBuilder(this.indexer);
     private readonly patchManager   = new PatchManager();
+    private readonly sessionManager: SessionManager;
 
     private conversationHistory: ConversationMessage[] = [];
     private currentModel: ModelId = 'claude-sonnet-4-5';
+    private currentSessionId: string = `s-${Date.now()}`;
+    // serialised messages kept in sync for session save
+    private currentMessages: unknown[] = [];
 
     constructor(
         private readonly context: vscode.ExtensionContext,
         private readonly usageTracker: UsageTracker,
     ) {
+        this.sessionManager = new SessionManager(context);
         void this.loadApiKey();
     }
 
@@ -52,6 +58,14 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             undefined,
             this.context.subscriptions,
         );
+
+        // Push session list to webview once it's ready
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this.post({ type: 'sessions', list: this.sessionManager.list() });
+            }
+        });
+        this.post({ type: 'sessions', list: this.sessionManager.list() });
     }
 
     // ─── Message handler ────────────────────────────────────────────────────
@@ -94,6 +108,58 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             case 'searchWorkspace':
                 await this.handleSearch(String(msg['query'] ?? ''));
                 break;
+
+            // ── Session management ──────────────────────────────────────────
+            case 'listSessions':
+                this.post({ type: 'sessions', list: this.sessionManager.list() });
+                break;
+
+            case 'loadSession': {
+                const sid     = String(msg['id']);
+                const session = this.sessionManager.load(sid);
+                if (session) {
+                    this.currentSessionId   = session.id;
+                    this.currentMessages    = session.messages;
+                    this.conversationHistory = session.history as ConversationMessage[];
+                    this.post({ type: 'sessionLoaded', session });
+                }
+                break;
+            }
+
+            case 'deleteSession': {
+                this.sessionManager.delete(String(msg['id']));
+                this.post({ type: 'sessions', list: this.sessionManager.list() });
+                break;
+            }
+
+            case 'newSession':
+                this.currentSessionId    = `s-${Date.now()}`;
+                this.currentMessages     = [];
+                this.conversationHistory = [];
+                this.post({ type: 'sessions', list: this.sessionManager.list() });
+                break;
+
+            // Webview syncs its messages array so we can persist them
+            case 'syncMessages':
+                this.currentMessages = (msg['messages'] as unknown[]) ?? [];
+                break;
+
+            // ── File navigation ─────────────────────────────────────────────
+            case 'openFile': {
+                const filePath = String(msg['path'] ?? '');
+                if (!filePath) break;
+                const folders  = vscode.workspace.workspaceFolders;
+                const root     = folders?.[0]?.uri.fsPath ?? '';
+                const fullPath = path.isAbsolute(filePath)
+                    ? filePath
+                    : path.join(root, filePath);
+                const uri = vscode.Uri.file(fullPath);
+                void vscode.window.showTextDocument(uri, {
+                    preview:       false,
+                    preserveFocus: false,
+                });
+                break;
+            }
         }
     }
 
@@ -109,19 +175,54 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
         const msgId = `a-${Date.now()}`;
 
-        // Signal webview to create the agent message placeholder
-        this.post({ type: 'agentStart', msgId });
+        // Build the execution plan upfront so the UI shows it immediately
+        const plan = this.buildPlan(mode, scopes);
 
-        // Build context with live status updates
+        // Signal webview: create placeholder + post plan
+        this.post({ type: 'agentStart', msgId });
+        this.post({ type: 'agentPlan', msgId, todos: plan.map(p => ({ ...p, status: 'not-started' })) });
+
+        const updateTodo = (id: string, status: 'in-progress' | 'completed') =>
+            this.post({ type: 'todoUpdate', msgId, id, status });
+
+        // Build context with live status + todo updates
         const { ctx, contextInfo } = await this.buildSmartContext(
-            content, scopes, mode, msgId,
+            content, scopes, mode, msgId, updateTodo,
         );
 
         // Send context info so the indicator updates before the stream
         this.post({ type: 'contextReady', info: contextInfo });
 
-        // Stream AI response
-        await this.streamWithId(content, model, ctx, mode, msgId, contextInfo);
+        // Mark generate step as in-progress, then stream
+        updateTodo('generate', 'in-progress');
+        await this.streamWithId(content, model, ctx, mode, msgId, contextInfo, () => {
+            updateTodo('generate', 'completed');
+        });
+    }
+
+    /** Builds a structured execution plan based on mode + context scopes. */
+    private buildPlan(mode: Mode, scopes: ContextScope[]): Array<{ id: string; text: string }> {
+        const steps: Array<{ id: string; text: string }> = [];
+
+        if (scopes.includes('file') || mode === 'analyze' || mode === 'edit') {
+            steps.push({ id: 'read-file', text: 'Read active file' });
+        }
+        if (scopes.includes('selection')) {
+            steps.push({ id: 'read-selection', text: 'Read selected code' });
+        }
+        if (scopes.includes('workspace') || scopes.includes('search') || mode === 'analyze') {
+            steps.push({ id: 'search', text: 'Search workspace' });
+        }
+        if (mode === 'analyze') {
+            steps.push({ id: 'trace', text: 'Trace related files' });
+            steps.push({ id: 'generate', text: 'Analyze code' });
+        } else if (mode === 'edit') {
+            steps.push({ id: 'generate', text: 'Generate patches' });
+        } else {
+            steps.push({ id: 'generate', text: 'Generate answer' });
+        }
+
+        return steps;
     }
 
     /**
@@ -133,6 +234,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         scopes: ContextScope[],
         mode: Mode,
         msgId: string,
+        updateTodo: (id: string, status: 'in-progress' | 'completed') => void,
     ): Promise<{ ctx: RequestContext; contextInfo: { files: string[]; tokens: number; estimatedCost: number } }> {
         const ctx: RequestContext = {};
         const attachedFiles: string[] = [];
@@ -144,6 +246,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
         if (editor && (scopes.includes('file') || mode === 'analyze')) {
             const fileName = path.basename(editor.document.uri.fsPath);
+            updateTodo('read-file', 'in-progress');
             status(`🔍 Checking active editor...`);
 
             const activeFile = await this.contextBuilder.buildActiveFileContext();
@@ -152,17 +255,22 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 attachedFiles.push(fileName);
                 status(`📄 Found: ${fileName}`);
             }
+            updateTodo('read-file', 'completed');
         } else if (!editor && scopes.includes('file')) {
+            updateTodo('read-file', 'in-progress');
             status(`📂 No active file — using workspace search`);
+            updateTodo('read-file', 'completed');
         }
 
         // ── 2. Selection ─────────────────────────────────────────────────────
         if (scopes.includes('selection')) {
+            updateTodo('read-selection', 'in-progress');
             const sel = await this.contextBuilder.buildSelectionContext();
             if (sel) {
                 ctx.selection = sel;
                 status(`✂️  Selection included`);
             }
+            updateTodo('read-selection', 'completed');
         }
 
         // ── 3. Project tree ──────────────────────────────────────────────────
@@ -174,6 +282,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         if (scopes.includes('workspace') || scopes.includes('search') || !editor) {
             const keywords = this.extractKeywords(message);
             if (keywords.length > 0) {
+                updateTodo('search', 'in-progress');
                 status(`🔎 Searching workspace for: ${keywords.slice(0, 3).join(', ')}...`);
 
                 const [fileResults, contentResults] = await Promise.all([
@@ -215,11 +324,13 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 } else {
                     status(`📭 No matching files found`);
                 }
+                updateTodo('search', 'completed');
             }
         }
 
         // ── 5. Analyze mode: also find related files to active file ──────────
         if (mode === 'analyze' && ctx.activeFile) {
+            updateTodo('trace', 'in-progress');
             const related = await this.indexer.findRelatedFiles(ctx.activeFile.fsPath, 4);
             if (related.length > 0) {
                 const extra = related.map(r => r.relativePath);
@@ -229,6 +340,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 attachedFiles.push(...extra.filter(e => !attachedFiles.includes(e)));
                 this.post({ type: 'agentFiles', msgId, files: attachedFiles });
             }
+            updateTodo('trace', 'completed');
         }
 
         // Rough token estimate: ~4 chars per token
@@ -256,6 +368,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         mode: Mode,
         msgId: string,
         contextInfo: { files: string[]; tokens: number; estimatedCost: number },
+        onGenerateComplete?: () => void,
     ): Promise<void> {
         const { system, messages } = await this.contextBuilder.buildPrompt(
             userMessage,
@@ -287,11 +400,83 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                     { role: 'user',      content: userMessage  },
                     { role: 'assistant', content: fullResponse },
                 );
+                onGenerateComplete?.();
+
+                // In edit mode, automatically apply the generated patches to disk
+                if (mode === 'edit') {
+                    void this.applyEditPatches(fullResponse);
+                }
+
+                // Auto-save session after every completed turn
+                void this.autoSaveSession();
             },
             onError: error => {
                 this.post({ type: 'error', msgId, message: error });
             },
         });
+    }
+
+    /**
+     * Parses SoftCode edit blocks from Claude's response and applies them
+     * directly to workspace files using VS Code WorkspaceEdit.
+     *
+     * Expected format in response:
+     *   ```<lang>
+     *   // @@softcode-edit: relative/path/to/file.ext
+     *   <full file content>
+     *   ```
+     */
+    private async applyEditPatches(response: string): Promise<void> {
+        const EDIT_RE = /```[\w.-]*\n\/\/ @@softcode-edit:\s*(.+?)\n([\s\S]*?)```/g;
+        const edits: Array<{ relPath: string; content: string }> = [];
+        let m: RegExpExecArray | null;
+
+        while ((m = EDIT_RE.exec(response)) !== null) {
+            const relPath = m[1].trim();
+            const content = m[2];
+            if (relPath && content !== undefined) {
+                edits.push({ relPath, content });
+            }
+        }
+
+        if (edits.length === 0) return;
+
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders?.length) return;
+        const rootPath = folders[0].uri.fsPath;
+
+        const wsEdit = new vscode.WorkspaceEdit();
+        const applied: string[] = [];
+
+        for (const { relPath, content } of edits) {
+            const fullPath = path.join(rootPath, relPath);
+            const uri = vscode.Uri.file(fullPath);
+            try {
+                const doc = await vscode.workspace.openTextDocument(uri);
+                const fullRange = new vscode.Range(
+                    doc.positionAt(0),
+                    doc.positionAt(doc.getText().length),
+                );
+                wsEdit.replace(uri, fullRange, content);
+                applied.push(relPath);
+            } catch {
+                // File doesn't exist yet — create it
+                wsEdit.createFile(uri, { overwrite: true });
+                wsEdit.insert(uri, new vscode.Position(0, 0), content);
+                applied.push(relPath);
+            }
+        }
+
+        const success = await vscode.workspace.applyEdit(wsEdit);
+        if (success && applied.length > 0) {
+            const label = applied.join(', ');
+            void vscode.window.showInformationMessage(
+                `SoftCode AI: Edited ${applied.length} file${applied.length > 1 ? 's' : ''} — ${label}`,
+            );
+            // Open the first edited file so user sees the changes
+            const firstUri = vscode.Uri.file(path.join(rootPath, applied[0]));
+            void vscode.window.showTextDocument(firstUri, { preserveFocus: true, preview: false });
+        }
     }
 
     // ─── Keyword extraction ──────────────────────────────────────────────────
@@ -320,6 +505,36 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             this.indexer.searchContent(query),
         ]);
         this.post({ type: 'searchResults', files, content });
+    }
+
+    // ─── Session auto-save ───────────────────────────────────────────────────
+
+    /**
+     * Called by the webview via 'syncMessages' to keep currentMessages up-to-date,
+     * and also internally after each turn to persist the session.
+     */
+    private autoSaveSession(): void {
+        if (this.currentMessages.length === 0 && this.conversationHistory.length === 0) return;
+
+        // Derive title from first user message
+        const firstUser = this.conversationHistory.find(m => m.role === 'user');
+        const title = firstUser
+            ? firstUser.content.slice(0, 60) + (firstUser.content.length > 60 ? '…' : '')
+            : 'New session';
+        const preview = this.conversationHistory
+            .filter(m => m.role === 'assistant')
+            .at(-1)?.content.slice(0, 80) ?? '';
+
+        const session: import('./sessionManager').SavedSession = {
+            id:        this.currentSessionId,
+            title,
+            timestamp: Date.now(),
+            preview,
+            messages:  this.currentMessages,
+            history:   this.conversationHistory as unknown[],
+        };
+        this.sessionManager.save(session);
+        this.post({ type: 'sessions', list: this.sessionManager.list() });
     }
 
     // ─── External command triggers ───────────────────────────────────────────

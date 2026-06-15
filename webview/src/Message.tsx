@@ -1,50 +1,94 @@
-import React, { type ReactNode } from 'react';
-import { type ChatMessage } from './types';
+import React, { useState, type ReactNode } from 'react';
+import { type ChatMessage, type PlanTodo, vscode } from './types';
 
 interface Props {
     message: ChatMessage;
 }
 
+// Sends a file path to the extension host to open in VS Code editor
+function openFile(filePath: string): void {
+    vscode.postMessage({ type: 'openFile', path: filePath });
+}
+
 export default function Message({ message }: Props): React.ReactElement {
+    const isAI = message.role === 'assistant';
+
     return (
         <div className={`message message-${message.role}`}>
-            <div className="message-role">
-                {message.role === 'user' ? 'You' : 'SoftCode AI'}
+            {/* Header: avatar + author name */}
+            <div className="message-header">
+                <div className={`msg-avatar ${isAI ? 'avatar-ai' : 'avatar-user'}`}>
+                    {isAI ? '⚡' : ''}
+                </div>
+                <span className="msg-author">{isAI ? 'SoftCode AI' : 'You'}</span>
             </div>
+
+            {/* Execution plan (todo list) */}
+            {message.plan && message.plan.length > 0 && (
+                <PlanPanel todos={message.plan} />
+            )}
 
             {/* Agent thinking log */}
             {message.statuses && message.statuses.length > 0 && (
-                <div className="agent-log">
-                    {message.statuses.map((s, i) => (
-                        <div
-                            key={i}
-                            className={`agent-status ${i < message.statuses!.length - 1 ? 'done' : 'active'}`}
-                        >
-                            {s}
-                        </div>
-                    ))}
-                </div>
+                <AgentLog statuses={message.statuses} />
             )}
 
-            {/* Files found chips */}
+            {/* Files found chips — click to open in editor */}
             {message.foundFiles && message.foundFiles.length > 0 && (
                 <div className="agent-files">
                     {message.foundFiles.map(f => (
-                        <span key={f} className="agent-file-chip">📄 {f}</span>
+                        <button
+                            key={f}
+                            className="agent-file-chip"
+                            onClick={() => openFile(f)}
+                            title={`Open ${f}`}
+                        >
+                            📄 {f}
+                        </button>
                     ))}
                 </div>
             )}
 
             {/* Main content */}
-            {message.content && (
-                <div className="message-content">
-                    <ContentRenderer content={message.content} />
+            {(message.content || message.isStreaming) && (
+                <div className="message-body">
+                    {message.content && (
+                        <div className="message-content">
+                            <ContentRenderer content={message.content} />
+                        </div>
+                    )}
+                    {message.isStreaming && !message.content && <span className="cursor">▊</span>}
+                    {message.isStreaming && message.content  && <span className="cursor"> ▊</span>}
                 </div>
             )}
 
-            {/* Streaming cursor */}
-            {message.isStreaming && !message.content && <span className="cursor">▊</span>}
-            {message.isStreaming && message.content && <span className="cursor"> ▊</span>}
+            {/* Action buttons (Apply All Fixes / Show Diff / Explain More) */}
+            {message.actions && message.actions.length > 0 && (
+                <div className="message-actions">
+                    {message.actions.map((action, i) => (
+                        <button
+                            key={i}
+                            className={`action-btn ${action.primary ? 'action-primary' : 'action-ghost'}`}
+                            onClick={() => vscode.postMessage({ type: 'action', action: action.action })}
+                        >
+                            {action.label}
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            {/* Sources */}
+            {message.sources && message.sources.length > 0 && (
+                <div className="message-sources">
+                    <span>Sources: </span>
+                    {message.sources.map((s, i) => (
+                        <React.Fragment key={s}>
+                            {i > 0 && ', '}
+                            <button className="source-link" onClick={() => openFile(s)}>{s}</button>
+                        </React.Fragment>
+                    ))}
+                </div>
+            )}
 
             {/* Meta row: usage + context info */}
             {(message.usage || message.contextInfo) && (
@@ -92,9 +136,11 @@ function ContentRenderer({ content }: { content: string }): React.ReactElement {
     return <>{nodes}</>;
 }
 
-/** Renders inline text with **bold** and `code` support */
+/** Renders inline text with **bold** and `code` support. Code that looks like a file path is clickable. */
 function InlineContent({ text }: { text: string }): React.ReactElement {
     const INLINE_RE = /(\*\*(.+?)\*\*|`([^`]+)`)/g;
+    // Matches things like src/foo/bar.ts, ./foo/bar.tsx, /abs/path.ts
+    const FILE_RE   = /^\.?\.?\/[\w/.\-]+\.\w{1,6}$|^[\w\-./]+\/[\w.\-]+\.\w{1,6}$/;
     const parts: ReactNode[] = [];
     let last = 0;
     let m: RegExpExecArray | null;
@@ -106,7 +152,21 @@ function InlineContent({ text }: { text: string }): React.ReactElement {
         if (m[2]) {
             parts.push(<strong key={m.index}>{m[2]}</strong>);
         } else if (m[3]) {
-            parts.push(<code key={m.index} className="inline-code">{m[3]}</code>);
+            const codeText = m[3];
+            if (FILE_RE.test(codeText)) {
+                parts.push(
+                    <code
+                        key={m.index}
+                        className="inline-code inline-code--file"
+                        onClick={() => openFile(codeText)}
+                        title={`Open ${codeText}`}
+                    >
+                        {codeText}
+                    </code>,
+                );
+            } else {
+                parts.push(<code key={m.index} className="inline-code">{codeText}</code>);
+            }
         }
         last = m.index + m[0].length;
     }
@@ -118,8 +178,121 @@ function InlineContent({ text }: { text: string }): React.ReactElement {
     return <>{parts}</>;
 }
 
+// ─── Plan Panel (todo list) ─────────────────────────────────────────────────
+
+function PlanPanel({ todos }: { todos: PlanTodo[] }): React.ReactElement {
+    const [collapsed, setCollapsed] = useState(false);
+    const done  = todos.filter(t => t.status === 'completed').length;
+    const total = todos.length;
+
+    return (
+        <div className="todo-panel">
+            <div className="todo-header" onClick={() => setCollapsed(c => !c)}>
+                <span className={`todo-collapse-arrow ${collapsed ? 'todo-collapse-arrow--collapsed' : ''}`}>
+                    <svg width="10" height="6" viewBox="0 0 10 6" fill="currentColor"><path d="M0 0l5 6 5-6z"/></svg>
+                </span>
+                <span className="todo-title">Todos ({done}/{total})</span>
+                <button
+                    className="todo-dismiss"
+                    onClick={e => { e.stopPropagation(); setCollapsed(true); }}
+                    title="Collapse"
+                >
+                    <svg width="9" height="9" viewBox="0 0 9 9"><path d="M1 1l7 7M8 1L1 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" fill="none"/></svg>
+                </button>
+            </div>
+            {!collapsed && (
+                <ul className="todo-list">
+                    {todos.map(todo => (
+                        <li key={todo.id} className={`todo-item todo-item--${todo.status}`}>
+                            <span className="todo-icon">
+                                {todo.status === 'completed'   && <CompletedIcon />}
+                                {todo.status === 'in-progress' && <ActiveIcon />}
+                                {todo.status === 'not-started' && <PendingIcon />}
+                            </span>
+                            <span className="todo-text">{todo.text}</span>
+                        </li>
+                    ))}
+                </ul>
+            )}
+        </div>
+    );
+}
+
+function CompletedIcon(): React.ReactElement {
+    return (
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <circle cx="7" cy="7" r="6.5" stroke="currentColor" strokeWidth="1"/>
+            <path d="M4 7l2.2 2.2L10 5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+    );
+}
+
+function ActiveIcon(): React.ReactElement {
+    return (
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <circle cx="7" cy="7" r="6.5" stroke="currentColor" strokeWidth="1"/>
+            <circle cx="7" cy="7" r="3" fill="currentColor"/>
+        </svg>
+    );
+}
+
+function PendingIcon(): React.ReactElement {
+    return (
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <circle cx="7" cy="7" r="6.5" stroke="currentColor" strokeWidth="1"/>
+        </svg>
+    );
+}
+
+// ─── Agent log (collapses when > 10 items) ─────────────────────────────────
+
+const LOG_LIMIT = 10;
+
+function AgentLog({ statuses }: { statuses: string[] }): React.ReactElement {
+    const [expanded, setExpanded] = useState(false);
+    const total   = statuses.length;
+    const visible = expanded || total <= LOG_LIMIT
+        ? statuses
+        : [...statuses.slice(0, 3), ...statuses.slice(total - 7)];
+
+    return (
+        <div className="agent-log">
+            {visible.map((s, i) => {
+                // Determine if this status is the last one (active) in the FULL list
+                const originalIdx = expanded || total <= LOG_LIMIT
+                    ? i
+                    : i < 3 ? i : total - 7 + (i - 3);
+                const isActive = originalIdx === total - 1;
+                return (
+                    <div key={i} className={`agent-status ${isActive ? 'active' : 'done'}`}>
+                        {s}
+                    </div>
+                );
+            })}
+            {total > LOG_LIMIT && (
+                <button className="log-expand-btn" onClick={() => setExpanded(e => !e)}>
+                    {expanded
+                        ? '▲ Show less'
+                        : `▼ ${total - LOG_LIMIT} more steps`}
+                </button>
+            )}
+        </div>
+    );
+}
+
+// ─── Code block (collapses when > 10 lines) ─────────────────────────────────
+
+const CODE_LINE_LIMIT = 10;
+
 function CodeBlock({ lang, code }: { lang: string; code: string }): React.ReactElement {
-    const [copied, setCopied] = React.useState(false);
+    const [copied,   setCopied]   = React.useState(false);
+    const [expanded, setExpanded] = React.useState(false);
+
+    const lines     = code.split('\n');
+    const tooLong   = lines.length > CODE_LINE_LIMIT;
+    const displayed = tooLong && !expanded
+        ? lines.slice(0, CODE_LINE_LIMIT).join('\n')
+        : code;
 
     const handleCopy = () => {
         void navigator.clipboard.writeText(code).then(() => {
@@ -131,10 +304,19 @@ function CodeBlock({ lang, code }: { lang: string; code: string }): React.ReactE
     return (
         <div className="code-block">
             {lang && <div className="code-lang">{lang}</div>}
-            <pre><code>{code}</code></pre>
-            <button className="copy-btn" onClick={handleCopy}>
-                {copied ? '✓ Copied' : 'Copy'}
-            </button>
+            <pre><code>{displayed}</code></pre>
+            <div className="code-block-footer">
+                {tooLong && (
+                    <button className="code-expand-btn" onClick={() => setExpanded(e => !e)}>
+                        {expanded
+                            ? '▲ Collapse'
+                            : `▼ Show ${lines.length - CODE_LINE_LIMIT} more lines`}
+                    </button>
+                )}
+                <button className="copy-btn" onClick={handleCopy}>
+                    {copied ? '✓ Copied' : 'Copy'}
+                </button>
+            </div>
         </div>
     );
 }

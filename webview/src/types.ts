@@ -1,12 +1,25 @@
 export type ModelId = 'claude-haiku-4-5' | 'claude-sonnet-4-5' | 'claude-opus-4-5';
 export type Mode = 'ask' | 'analyze' | 'edit';
 export type ContextScope = 'file' | 'selection' | 'workspace' | 'search';
+export type TodoStatus = 'not-started' | 'in-progress' | 'completed';
+
+export interface PlanTodo {
+    id:     string;
+    text:   string;
+    status: TodoStatus;
+}
 
 export const MODEL_INFO: Record<ModelId, { label: string; description: string; icon: string }> = {
-    'claude-haiku-4-5':  { label: 'Haiku',  icon: '⚡', description: 'Fast'              },
-    'claude-sonnet-4-5': { label: 'Sonnet', icon: '🧠', description: 'Balanced · default' },
-    'claude-opus-4-5':   { label: 'Opus',   icon: '🚀', description: 'Advanced'           },
+    'claude-haiku-4-5':  { label: 'Haiku 3.5', icon: '⚡', description: 'Fast'     },
+    'claude-sonnet-4-5': { label: 'Sonnet 4',  icon: '🧠', description: 'Balanced' },
+    'claude-opus-4-5':   { label: 'Opus 4',    icon: '🚀', description: 'Advanced' },
 };
+
+export interface MessageAction {
+    label:    string;
+    primary?: boolean;
+    action:   string;
+}
 
 export const MODE_INFO: Record<Mode, { label: string; description: string }> = {
     ask:     { label: 'Ask',     description: 'Answer questions'    },
@@ -27,7 +40,10 @@ export interface ChatMessage {
     isStreaming?:  boolean;
     statuses?:    string[];      // agent thinking steps
     foundFiles?:  string[];      // files discovered
+    plan?:        PlanTodo[];    // structured execution plan
     contextInfo?: ContextInfo;   // context summary at bottom
+    actions?:     MessageAction[]; // action buttons below AI response
+    sources?:     string[];        // source file links below AI response
     usage?: {
         inputTokens:  number;
         outputTokens: number;
@@ -40,6 +56,13 @@ export interface UsageStats {
     dailyCost:     number;
     totalRequests: number;
     totalTokens:   number;
+}
+
+export interface SessionMeta {
+    id:        string;
+    title:     string;
+    timestamp: number;
+    preview:   string;
 }
 
 // VS Code Webview API injected at runtime
