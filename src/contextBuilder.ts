@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { SecurityFilter } from './securityFilter';
 import { WorkspaceIndexer } from './workspaceIndexer';
 
+export type Mode = 'ask' | 'analyze' | 'edit';
+
 export interface ConversationMessage {
     role: 'user' | 'assistant';
     content: string;
@@ -13,10 +15,44 @@ export interface RequestContext {
     projectTree?: string;
     attachedFiles?: Array<{ fsPath: string; content: string }>;
     searchResults?: string;
+    fileBundle?: string;   // multiple related files merged
 }
 
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_FILE_CHARS = 50_000;
+
+const MODE_SYSTEM: Record<Mode, string[]> = {
+    ask: [
+        'You are SoftCode AI, an intelligent coding assistant inside VS Code.',
+        'You have full access to the workspace. Use the provided context (project tree, active file, related files) to give specific, accurate answers.',
+        'Reference actual filenames and line numbers. Never say you cannot see code when context is provided.',
+        'Be concise and practical.',
+        'Never reveal API keys, credentials, or secrets.',
+    ],
+    analyze: [
+        'You are SoftCode AI in ANALYZE mode — a senior engineer performing a deep code review.',
+        'You have been given the active file and related workspace files. Analyze them thoroughly.',
+        'Structure your response as:',
+        '1. File analyzed (name + purpose)',
+        '2. Issues found — numbered list, each with: description, location (file:line if possible), severity (High/Medium/Low), confidence %',
+        '3. Brief summary',
+        '4. End with: "Generate fixes for all issues?" or "Which issue should I fix first?"',
+        'If no issues are found, say so clearly and suggest improvements.',
+        'Never say you cannot see code when context is provided. Never ask for code to be pasted.',
+    ],
+    edit: [
+        'You are SoftCode AI in EDIT mode — you generate precise code patches.',
+        'When suggesting changes, always show a clear before/after diff or the exact replacement block.',
+        'Format diffs as:',
+        '```diff',
+        '- old line',
+        '+ new line',
+        '```',
+        'Explain each change briefly. Group related changes together.',
+        'Never make changes beyond what was requested.',
+        'Never reveal API keys, credentials, or secrets.',
+    ],
+};
 
 export class ContextBuilder {
     constructor(private readonly indexer: WorkspaceIndexer) {}
@@ -28,16 +64,9 @@ export class ContextBuilder {
         userMessage: string,
         ctx: RequestContext,
         history: ConversationMessage[],
+        mode: Mode = 'ask',
     ): Promise<{ system: string; messages: ConversationMessage[] }> {
-        const systemParts: string[] = [
-            'You are SoftCode AI, an intelligent coding assistant integrated directly into VS Code.',
-            'You have full access to the user\'s workspace: project structure, active file, and search results are provided below.',
-            'Always use the workspace context to give specific, grounded answers. Reference actual file names and line numbers when relevant.',
-            'If the user asks about code without specifying a file, look at the active file and search results provided.',
-            'Be concise and practical. Prefer focused code examples over lengthy explanations.',
-            'When suggesting code changes, clearly show the before/after diff or the exact replacement.',
-            'Never reveal, repeat, or log API keys, credentials, or secrets.',
-        ];
+        const systemParts: string[] = [...MODE_SYSTEM[mode]];
 
         if (ctx.projectTree) {
             systemParts.push(`\n## Project Structure\n\`\`\`\n${ctx.projectTree}\n\`\`\``);
@@ -52,6 +81,10 @@ export class ContextBuilder {
 
         if (ctx.selection) {
             systemParts.push(`\n## Selected Code\n\`\`\`\n${ctx.selection}\n\`\`\``);
+        }
+
+        if (ctx.fileBundle) {
+            systemParts.push(`\n## Related Files\n${ctx.fileBundle}`);
         }
 
         if (ctx.attachedFiles?.length) {

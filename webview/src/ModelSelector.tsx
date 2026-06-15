@@ -14,10 +14,10 @@ export default function ModelSelector({ selectedModel, onModelChange }: Props): 
             onChange={e => onModelChange(e.target.value as ModelId)}
             title="Select Claude model"
         >
-            {(Object.entries(MODEL_INFO) as [ModelId, { label: string; description: string }][]).map(
+            {(Object.entries(MODEL_INFO) as [ModelId, typeof MODEL_INFO[ModelId]][]).map(
                 ([id, info]) => (
                     <option key={id} value={id}>
-                        {info.label} – {info.description}
+                        {info.icon} {info.label} – {info.description}
                     </option>
                 ),
             )}

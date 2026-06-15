@@ -2,10 +2,12 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ClaudeClient, ModelId } from './claudeClient';
-import { ContextBuilder, ConversationMessage, RequestContext } from './contextBuilder';
+import { ContextBuilder, ConversationMessage, RequestContext, Mode } from './contextBuilder';
 import { WorkspaceIndexer } from './workspaceIndexer';
 import { UsageTracker } from './usageTracker';
 import { PatchManager } from './patchManager';
+
+type ContextScope = 'file' | 'selection' | 'workspace' | 'search';
 
 export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'softcodeAI.chatView';
@@ -62,8 +64,8 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 await this.handleChat(
                     String(msg['content'] ?? ''),
                     String(msg['model']  ?? this.currentModel) as ModelId,
-                    Boolean(msg['useActiveFile']),
-                    Boolean(msg['useSelection']),
+                    String(msg['mode']   ?? 'ask') as Mode,
+                    (msg['contextScopes'] as ContextScope[]) ?? ['file', 'workspace'],
                 );
                 break;
 
@@ -95,168 +97,222 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    // ─── Chat ───────────────────────────────────────────────────────────────
+    // ─── Smart agent chat ────────────────────────────────────────────────────
 
     private async handleChat(
         content: string,
         model: ModelId,
-        useActiveFile: boolean,
-        useSelection: boolean,
+        mode: Mode,
+        scopes: ContextScope[],
     ): Promise<void> {
-        if (!content.trim()) {
-            return;
-        }
+        if (!content.trim()) return;
 
-        const ctx: RequestContext = await this.buildWorkspaceContext(
-            content,
-            useActiveFile,
-            useSelection,
+        const msgId = `a-${Date.now()}`;
+
+        // Signal webview to create the agent message placeholder
+        this.post({ type: 'agentStart', msgId });
+
+        // Build context with live status updates
+        const { ctx, contextInfo } = await this.buildSmartContext(
+            content, scopes, mode, msgId,
         );
 
-        await this.stream(content, model, ctx);
+        // Send context info so the indicator updates before the stream
+        this.post({ type: 'contextReady', info: contextInfo });
+
+        // Stream AI response
+        await this.streamWithId(content, model, ctx, mode, msgId, contextInfo);
     }
 
     /**
-     * Automatically gathers relevant workspace context for a user message.
-     *
-     * Always included:
-     *   - Project tree (top-level structure)
-     *   - Active file (unless blocked)
-     *
-     * Auto-included when relevant:
-     *   - Selected code (if there is a selection)
-     *   - File + content search results matching keywords from the message
-     *
-     * Manual toggles still respected and can add context on top.
+     * Gathers workspace context autonomously, posting status steps to the webview
+     * so the user sees exactly what SoftCode is reading.
      */
-    private async buildWorkspaceContext(
+    private async buildSmartContext(
         message: string,
-        forceActiveFile: boolean,
-        forceSelection: boolean,
-    ): Promise<RequestContext> {
+        scopes: ContextScope[],
+        mode: Mode,
+        msgId: string,
+    ): Promise<{ ctx: RequestContext; contextInfo: { files: string[]; tokens: number; estimatedCost: number } }> {
         const ctx: RequestContext = {};
+        const attachedFiles: string[] = [];
 
-        // 1. Project tree – always provided so Claude understands the project layout
-        ctx.projectTree = await this.indexer.getProjectTree(3);
+        const status = (text: string) => this.post({ type: 'agentStatus', msgId, text });
 
-        // 2. Active file – included by default (not just when toggled)
-        ctx.activeFile = await this.contextBuilder.buildActiveFileContext();
+        // ── 1. Active file ───────────────────────────────────────────────────
+        const editor = vscode.window.activeTextEditor;
 
-        // 3. Selection – include if forced, or if there is an active selection
-        const selection = await this.contextBuilder.buildSelectionContext();
-        if (selection || forceSelection) {
-            ctx.selection = selection;
+        if (editor && (scopes.includes('file') || mode === 'analyze')) {
+            const fileName = path.basename(editor.document.uri.fsPath);
+            status(`🔍 Checking active editor...`);
+
+            const activeFile = await this.contextBuilder.buildActiveFileContext();
+            if (activeFile) {
+                ctx.activeFile = activeFile;
+                attachedFiles.push(fileName);
+                status(`📄 Found: ${fileName}`);
+            }
+        } else if (!editor && scopes.includes('file')) {
+            status(`📂 No active file — using workspace search`);
         }
 
-        // 4. Automatic workspace search based on keywords in the message
-        const keywords = this.extractKeywords(message);
-        if (keywords.length > 0) {
-            const query = keywords.join(' ');
-            const [fileResults, contentResults] = await Promise.all([
-                this.indexer.searchFiles(query, 10),
-                this.indexer.searchContent(query, 8),
-            ]);
-
-            // Filter out the active file (already included above) to avoid duplication
-            const activePath = ctx.activeFile?.fsPath;
-            const relevantFiles = fileResults.filter(f => f.fsPath !== activePath);
-            const relevantContent = contentResults.filter(f => f.fsPath !== activePath);
-
-            if (relevantFiles.length > 0 || relevantContent.length > 0) {
-                const parts: string[] = [];
-
-                if (relevantFiles.length > 0) {
-                    parts.push('### Matching files');
-                    relevantFiles.forEach(f =>
-                        parts.push(`- ${f.relativePath}`),
-                    );
-                }
-
-                if (relevantContent.length > 0) {
-                    parts.push('\n### Matching code snippets');
-                    relevantContent.forEach(f => {
-                        parts.push(`**${f.relativePath}**`);
-                        if (f.snippet) {
-                            parts.push('```\n' + f.snippet + '\n```');
-                        }
-                    });
-                }
-
-                ctx.searchResults = parts.join('\n');
+        // ── 2. Selection ─────────────────────────────────────────────────────
+        if (scopes.includes('selection')) {
+            const sel = await this.contextBuilder.buildSelectionContext();
+            if (sel) {
+                ctx.selection = sel;
+                status(`✂️  Selection included`);
             }
         }
 
-        // 5. If the user explicitly toggled active-file but it was blocked/unavailable, warn
-        if (forceActiveFile && !ctx.activeFile) {
-            ctx.searchResults = (ctx.searchResults ?? '') +
-                '\n\n> Note: active file is unavailable or filtered for security reasons.';
+        // ── 3. Project tree ──────────────────────────────────────────────────
+        if (scopes.includes('workspace') || !editor) {
+            ctx.projectTree = await this.indexer.getProjectTree(3);
         }
 
-        return ctx;
+        // ── 4. Keyword search across workspace ───────────────────────────────
+        if (scopes.includes('workspace') || scopes.includes('search') || !editor) {
+            const keywords = this.extractKeywords(message);
+            if (keywords.length > 0) {
+                status(`🔎 Searching workspace for: ${keywords.slice(0, 3).join(', ')}...`);
+
+                const [fileResults, contentResults] = await Promise.all([
+                    this.indexer.searchFiles(keywords.join(' '), 8),
+                    this.indexer.searchContent(keywords.join(' '), 6),
+                ]);
+
+                const activePath = ctx.activeFile?.fsPath;
+                const relevant = [
+                    ...fileResults.filter(f => f.fsPath !== activePath),
+                    ...contentResults.filter(f => f.fsPath !== activePath),
+                ].filter((v, i, a) => a.findIndex(x => x.fsPath === v.fsPath) === i)
+                 .slice(0, 6);
+
+                if (relevant.length > 0) {
+                    const relPaths = relevant.map(r => r.relativePath);
+                    this.post({ type: 'agentFiles', msgId, files: relPaths });
+                    status(`✓ Found ${relevant.length} related file${relevant.length > 1 ? 's' : ''}`);
+                    attachedFiles.push(...relPaths);
+
+                    // For analyze/edit mode, read full content of related files
+                    if (mode === 'analyze' || mode === 'edit') {
+                        const bundle = await this.indexer.buildFileBundle(
+                            relevant.map(r => r.fsPath),
+                        );
+                        ctx.fileBundle = bundle.content;
+                    } else {
+                        // For ask mode, just show snippets
+                        const parts: string[] = [];
+                        relevant.forEach(f => {
+                            if (f.snippet) {
+                                parts.push(`**${f.relativePath}**\n\`\`\`\n${f.snippet}\n\`\`\``);
+                            } else {
+                                parts.push(`- ${f.relativePath}`);
+                            }
+                        });
+                        ctx.searchResults = parts.join('\n\n');
+                    }
+                } else {
+                    status(`📭 No matching files found`);
+                }
+            }
+        }
+
+        // ── 5. Analyze mode: also find related files to active file ──────────
+        if (mode === 'analyze' && ctx.activeFile) {
+            const related = await this.indexer.findRelatedFiles(ctx.activeFile.fsPath, 4);
+            if (related.length > 0) {
+                const extra = related.map(r => r.relativePath);
+                status(`🔗 Tracing ${extra.length} related file${extra.length > 1 ? 's' : ''}...`);
+                const bundle = await this.indexer.buildFileBundle(related.map(r => r.fsPath));
+                ctx.fileBundle = (ctx.fileBundle ? ctx.fileBundle + '\n\n' : '') + bundle.content;
+                attachedFiles.push(...extra.filter(e => !attachedFiles.includes(e)));
+                this.post({ type: 'agentFiles', msgId, files: attachedFiles });
+            }
+        }
+
+        // Rough token estimate: ~4 chars per token
+        const contextText = [
+            ctx.projectTree ?? '',
+            ctx.activeFile?.content ?? '',
+            ctx.selection ?? '',
+            ctx.fileBundle ?? '',
+            ctx.searchResults ?? '',
+        ].join('');
+        const tokens = Math.ceil(contextText.length / 4);
+        const costPer1M = model => ({ 'claude-haiku-4-5': 0.80, 'claude-sonnet-4-5': 3.00, 'claude-opus-4-5': 15.00 })[model] ?? 3.00;
+        const estimatedCost = (tokens / 1_000_000) * costPer1M(this.currentModel);
+
+        return {
+            ctx,
+            contextInfo: { files: attachedFiles, tokens, estimatedCost },
+        };
     }
 
-    /** Extract meaningful keywords from a user message for workspace searching. */
-    private extractKeywords(message: string): string[] {
-        // Strip common filler words
-        const STOPWORDS = new Set([
-            'a', 'an', 'the', 'is', 'it', 'in', 'of', 'to', 'and', 'or',
-            'this', 'that', 'for', 'my', 'me', 'what', 'how', 'why', 'when',
-            'can', 'you', 'i', 'be', 'do', 'are', 'has', 'with', 'on',
-            'need', 'want', 'help', 'please', 'fix', 'show', 'tell', 'get',
-            'make', 'let', 'give', 'look', 'check', 'write', 'find', 'read',
-        ]);
-
-        return message
-            .toLowerCase()
-            .replace(/[^a-z0-9 _-]/g, ' ')
-            .split(/\s+/)
-            .filter(w => w.length > 2 && !STOPWORDS.has(w))
-            .slice(0, 5); // top 5 keywords
-    }
-
-    private async stream(
+    private async streamWithId(
         userMessage: string,
         model: ModelId,
         ctx: RequestContext,
-        displayMessage?: string,
+        mode: Mode,
+        msgId: string,
+        contextInfo: { files: string[]; tokens: number; estimatedCost: number },
     ): Promise<void> {
         const { system, messages } = await this.contextBuilder.buildPrompt(
             userMessage,
             ctx,
             this.conversationHistory,
+            mode,
         );
-
-        this.post({ type: 'streamStart', userMessage: displayMessage });
 
         let fullResponse = '';
 
         await this.claudeClient.streamMessage(model, system, messages, {
             onText: text => {
                 fullResponse += text;
-                this.post({ type: 'streamChunk', text });
+                this.post({ type: 'streamChunk', msgId, text });
             },
             onComplete: (inputTokens, outputTokens) => {
                 const record = this.usageTracker.track(model, inputTokens, outputTokens);
                 this.post({
                     type: 'streamEnd',
+                    msgId,
                     usage: {
                         inputTokens,
                         outputTokens,
                         cost: record.estimatedCostUsd,
                     },
+                    contextInfo,
                 });
                 this.conversationHistory.push(
-                    { role: 'user',      content: userMessage   },
-                    { role: 'assistant', content: fullResponse  },
+                    { role: 'user',      content: userMessage  },
+                    { role: 'assistant', content: fullResponse },
                 );
             },
             onError: error => {
-                this.post({ type: 'error', message: error });
+                this.post({ type: 'error', msgId, message: error });
             },
         });
     }
 
-    // ─── Workspace search ───────────────────────────────────────────────────
+    // ─── Keyword extraction ──────────────────────────────────────────────────
+
+    private extractKeywords(message: string): string[] {
+        const STOPWORDS = new Set([
+            'a','an','the','is','it','in','of','to','and','or','this','that',
+            'for','my','me','what','how','why','when','can','you','i','be',
+            'do','are','has','with','on','need','want','help','please','fix',
+            'show','tell','get','make','let','give','look','check','write',
+            'find','read','also','just','from','at','by','so','if','else',
+        ]);
+        return message
+            .toLowerCase()
+            .replace(/[^a-z0-9 _\-.]/g, ' ')
+            .split(/\s+/)
+            .filter(w => w.length > 2 && !STOPWORDS.has(w))
+            .slice(0, 6);
+    }
+
+    // ─── Workspace search ────────────────────────────────────────────────────
 
     private async handleSearch(query: string): Promise<void> {
         const [files, content] = await Promise.all([
@@ -266,82 +322,35 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         this.post({ type: 'searchResults', files, content });
     }
 
-    // ─── External triggers (called from extension commands) ─────────────────
+    // ─── External command triggers ───────────────────────────────────────────
 
     public async triggerExplainSelection(): Promise<void> {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            return;
-        }
-
-        const selection = await this.contextBuilder.buildSelectionContext();
-        if (!selection) {
-            vscode.window.showWarningMessage('SoftCode AI: No code selected.');
-            return;
-        }
-
-        const fileName = path.basename(editor.document.uri.fsPath);
-        await this.stream(
-            `Explain this code from ${fileName}`,
-            this.currentModel,
-            { selection },
-            `Explain selection in ${fileName}`,
-        );
+        const sel = await this.contextBuilder.buildSelectionContext();
+        if (!sel) { vscode.window.showWarningMessage('SoftCode AI: No code selected.'); return; }
+        const fileName = vscode.window.activeTextEditor
+            ? path.basename(vscode.window.activeTextEditor.document.uri.fsPath) : 'file';
+        await this.handleChat(`Explain this code from ${fileName}`, this.currentModel, 'ask', ['selection', 'file']);
     }
 
     public async triggerFixError(): Promise<void> {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            return;
-        }
-
-        const activeFile = await this.contextBuilder.buildActiveFileContext();
-        const fileName   = path.basename(editor.document.uri.fsPath);
-        await this.stream(
-            `Find and fix errors or bugs in this file.`,
-            this.currentModel,
-            { activeFile },
-            `Fix errors in ${fileName}`,
-        );
+        if (!vscode.window.activeTextEditor) return;
+        await this.handleChat('Find and fix all errors and bugs in this file.', this.currentModel, 'analyze', ['file', 'workspace']);
     }
 
     public async triggerRefactorFile(): Promise<void> {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            return;
-        }
-
-        const activeFile = await this.contextBuilder.buildActiveFileContext();
-        const fileName   = path.basename(editor.document.uri.fsPath);
-        await this.stream(
-            `Refactor this file to improve readability, maintainability, and performance. Explain the key changes.`,
-            this.currentModel,
-            { activeFile },
-            `Refactor ${fileName}`,
-        );
+        if (!vscode.window.activeTextEditor) return;
+        await this.handleChat('Refactor this file to improve readability, maintainability, and performance. Explain the key changes.', this.currentModel, 'edit', ['file']);
     }
 
     public async triggerGenerateTests(): Promise<void> {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            return;
-        }
-
-        const activeFile = await this.contextBuilder.buildActiveFileContext();
-        const fileName   = path.basename(editor.document.uri.fsPath);
-        await this.stream(
-            `Generate comprehensive unit tests for this file. Use the appropriate test framework for the language.`,
-            this.currentModel,
-            { activeFile },
-            `Generate tests for ${fileName}`,
-        );
+        if (!vscode.window.activeTextEditor) return;
+        await this.handleChat('Generate comprehensive unit tests for this file. Use the appropriate test framework for the language.', this.currentModel, 'edit', ['file', 'workspace']);
     }
 
     // ─── HTML generation ────────────────────────────────────────────────────
 
     private buildHtml(webview: vscode.Webview): string {
         const distPath = path.join(this.context.extensionUri.fsPath, 'webview', 'dist');
-
         let jsFile: string | undefined;
         let cssFile: string | undefined;
 
@@ -353,16 +362,13 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             return this.buildSetupHtml();
         }
 
-        if (!jsFile) {
-            return this.buildSetupHtml();
-        }
+        if (!jsFile) return this.buildSetupHtml();
 
-        const distUri  = vscode.Uri.joinPath(this.context.extensionUri, 'webview', 'dist');
+        const distUri   = vscode.Uri.joinPath(this.context.extensionUri, 'webview', 'dist');
         const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(distUri, jsFile));
         const styleUri  = cssFile
             ? webview.asWebviewUri(vscode.Uri.joinPath(distUri, cssFile))
             : undefined;
-
         const nonce = this.getNonce();
 
         return `<!DOCTYPE html>
@@ -391,34 +397,15 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 <head>
   <meta charset="UTF-8">
   <style>
-    body {
-      font-family: var(--vscode-font-family);
-      font-size: var(--vscode-font-size);
-      color: var(--vscode-foreground);
-      background: var(--vscode-editor-background);
-      padding: 20px;
-      line-height: 1.6;
-    }
-    code {
-      background: var(--vscode-textCodeBlock-background);
-      padding: 2px 6px;
-      border-radius: 3px;
-      font-family: var(--vscode-editor-font-family);
-    }
-    pre {
-      background: var(--vscode-textCodeBlock-background);
-      padding: 12px;
-      border-radius: 4px;
-      margin-top: 12px;
-    }
+    body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 20px; line-height: 1.6; }
+    code { background: var(--vscode-textCodeBlock-background); padding: 2px 6px; border-radius: 3px; font-family: var(--vscode-editor-font-family); }
+    pre  { background: var(--vscode-textCodeBlock-background); padding: 12px; border-radius: 4px; margin-top: 12px; }
   </style>
 </head>
 <body>
   <h3>⚡ SoftCode AI</h3>
   <p>Build the webview UI to get started:</p>
-  <pre>cd webview
-npm install
-npm run build</pre>
+  <pre>cd webview\nnpm install\nnpm run build</pre>
   <p>Then reload the window (<code>Cmd+Shift+P → Developer: Reload Window</code>).</p>
 </body>
 </html>`;
@@ -432,15 +419,11 @@ npm run build</pre>
 
     private async loadApiKey(): Promise<void> {
         const key = await this.context.secrets.get('anthropic_api_key');
-        if (key) {
-            this.claudeClient.setApiKey(key);
-        }
+        if (key) this.claudeClient.setApiKey(key);
     }
 
     private getNonce(): string {
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-        return Array.from({ length: 32 }, () =>
-            chars[Math.floor(Math.random() * chars.length)],
-        ).join('');
+        return Array.from({ length: 32 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
     }
 }

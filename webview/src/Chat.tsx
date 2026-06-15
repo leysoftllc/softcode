@@ -1,19 +1,18 @@
 import React, { useRef, useEffect, useState, type FormEvent, type KeyboardEvent } from 'react';
 import Message from './Message';
-import { type ChatMessage } from './types';
+import { type ChatMessage, type ContextInfo } from './types';
 
 interface Props {
     messages:    ChatMessage[];
     isStreaming: boolean;
     onSend:      (content: string) => void;
+    contextInfo?: ContextInfo | null;
 }
 
-export default function Chat({ messages, isStreaming, onSend }: Props): React.ReactElement {
+export default function Chat({ messages, isStreaming, onSend, contextInfo }: Props): React.ReactElement {
     const [input,  setInput]  = useState('');
     const bottomRef           = useRef<HTMLDivElement>(null);
-    const textareaRef         = useRef<HTMLTextAreaElement>(null);
 
-    // Auto-scroll to the latest message
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [messages]);
@@ -25,27 +24,28 @@ export default function Chat({ messages, isStreaming, onSend }: Props): React.Re
         setInput('');
     };
 
-    const handleSubmit = (e: FormEvent) => {
-        e.preventDefault();
-        submit();
-    };
+    const handleSubmit = (e: FormEvent) => { e.preventDefault(); submit(); };
 
     const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            submit();
-        }
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
     };
+
+    const placeholder = isStreaming
+        ? 'SoftCode is thinking…'
+        : 'Ask anything about your code… (Enter to send)';
 
     return (
         <div className="chat">
             <div className="messages">
                 {messages.length === 0 && (
                     <div className="empty-state">
-                        <p>👋 Ask anything about your code.</p>
-                        <p className="hint">
-                            Toggle <strong>File</strong> or <strong>Selection</strong> above to include context.
-                        </p>
+                        <div className="empty-icon">⚡</div>
+                        <div className="empty-title">SoftCode AI</div>
+                        <div className="empty-hints">
+                            <span>📄 Opens active file automatically</span>
+                            <span>🔍 Searches your workspace for context</span>
+                            <span>🧠 Reasons across multiple files</span>
+                        </div>
                     </div>
                 )}
 
@@ -56,14 +56,23 @@ export default function Chat({ messages, isStreaming, onSend }: Props): React.Re
                 <div ref={bottomRef} />
             </div>
 
+            {/* Context indicator */}
+            {contextInfo && contextInfo.files.length > 0 && (
+                <div className="context-indicator">
+                    📎 {contextInfo.files.slice(0, 3).join(' · ')}
+                    {contextInfo.files.length > 3 && ` +${contextInfo.files.length - 3} more`}
+                    {' · '}~{contextInfo.tokens.toLocaleString()} tokens
+                    {' · '}${contextInfo.estimatedCost.toFixed(4)}
+                </div>
+            )}
+
             <form className="input-form" onSubmit={handleSubmit}>
                 <textarea
-                    ref={textareaRef}
                     className="input-textarea"
                     value={input}
                     onChange={e => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder="Ask about your code… (Enter to send, Shift+Enter for newline)"
+                    placeholder={placeholder}
                     rows={3}
                     disabled={isStreaming}
                 />
@@ -77,4 +86,10 @@ export default function Chat({ messages, isStreaming, onSend }: Props): React.Re
             </form>
         </div>
     );
+}
+
+interface Props {
+    messages:    ChatMessage[];
+    isStreaming: boolean;
+    onSend:      (content: string) => void;
 }

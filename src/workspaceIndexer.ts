@@ -177,4 +177,49 @@ export class WorkspaceIndexer {
             return null;
         }
     }
+
+    /**
+     * Find files related to a given file by searching for its name/stem
+     * in other files (imports, references, etc.).
+     */
+    async findRelatedFiles(fsPath: string, limit = 6): Promise<FileResult[]> {
+        const stem = path.basename(fsPath, path.extname(fsPath));
+        const [byName, byContent] = await Promise.all([
+            this.searchFiles(stem, limit * 2),
+            this.searchContent(stem, limit * 2),
+        ]);
+
+        const seen = new Set<string>([fsPath]);
+        const results: FileResult[] = [];
+
+        for (const r of [...byName, ...byContent]) {
+            if (!seen.has(r.fsPath)) {
+                seen.add(r.fsPath);
+                results.push(r);
+                if (results.length >= limit) break;
+            }
+        }
+        return results;
+    }
+
+    /**
+     * Read multiple files and format them as a single context string.
+     * Returns the combined string and list of successfully read relative paths.
+     */
+    async buildFileBundle(fsPaths: string[]): Promise<{ content: string; files: string[] }> {
+        const folders = vscode.workspace.workspaceFolders;
+        const rootPath = folders?.[0].uri.fsPath ?? '';
+        const parts: string[] = [];
+        const files: string[] = [];
+
+        for (const fsPath of fsPaths) {
+            const content = await this.readFile(fsPath);
+            if (!content) continue;
+            const rel = rootPath ? path.relative(rootPath, fsPath) : path.basename(fsPath);
+            parts.push(`### ${rel}\n\`\`\`\n${content}\n\`\`\``);
+            files.push(rel);
+        }
+
+        return { content: parts.join('\n\n'), files };
+    }
 }
