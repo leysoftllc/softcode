@@ -1,5 +1,5 @@
 import React, { useState, type ReactNode } from 'react';
-import { type ChatMessage, type PlanTodo, vscode } from './types';
+import { type ChatMessage, type EditEvent, type PlanTodo, vscode } from './types';
 
 interface Props {
     message: ChatMessage;
@@ -50,16 +50,20 @@ export default function Message({ message }: Props): React.ReactElement {
             )}
 
             {/* Main content */}
-            {(message.content || message.isStreaming) && (
+            {(visibleContent(message.content) || message.isStreaming) && (
                 <div className="message-body">
-                    {message.content && (
+                    {visibleContent(message.content) && (
                         <div className="message-content">
-                            <ContentRenderer content={message.content} />
+                            <ContentRenderer content={visibleContent(message.content)} />
                         </div>
                     )}
-                    {message.isStreaming && !message.content && <span className="cursor">▊</span>}
-                    {message.isStreaming && message.content  && <span className="cursor"> ▊</span>}
+                    {message.isStreaming && !visibleContent(message.content) && <span className="cursor">▊</span>}
+                    {message.isStreaming && visibleContent(message.content)  && <span className="cursor"> ▊</span>}
                 </div>
+            )}
+
+            {message.editEvents && message.editEvents.length > 0 && (
+                <EditEvents events={message.editEvents} />
             )}
 
             {/* Action buttons (Apply All Fixes / Show Diff / Explain More) */}
@@ -109,6 +113,13 @@ export default function Message({ message }: Props): React.ReactElement {
             )}
         </div>
     );
+}
+
+function visibleContent(content: string): string {
+    return content
+        .replace(/```[\w.-]*\n\/\/ @@softcode-edit:\s*.+?\n[\s\S]*?```/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 
 // ─── Content renderer (handles fenced code + inline code + bold) ─────────────
@@ -240,6 +251,72 @@ function PendingIcon(): React.ReactElement {
     return (
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
             <circle cx="7" cy="7" r="6.5" stroke="currentColor" strokeWidth="1"/>
+        </svg>
+    );
+}
+
+function EditEvents({ events }: { events: EditEvent[] }): React.ReactElement {
+    const totalAdded = events.reduce((sum, event) => sum + event.additions, 0);
+    const totalDeleted = events.reduce((sum, event) => sum + event.deletions, 0);
+    const isEditing = events.some(event => event.status === 'editing');
+    const title = events.length === 1
+        ? `${isEditing ? 'Editing' : 'Edited'} a file`
+        : `${isEditing ? 'Editing' : 'Edited'} ${events.length} files`;
+
+    return (
+        <div className="edit-events">
+            <div className="edit-summary">
+                <EditPencilIcon />
+                <span>{title}</span>
+                <span className="edit-chevron">⌄</span>
+            </div>
+            {events.map(event => (
+                <div key={event.id} className="edit-event">
+                    <button
+                        type="button"
+                        className="edit-event-line"
+                        onClick={() => openFile(event.file)}
+                        title={`Open ${event.file}`}
+                    >
+                        <span>{event.status === 'editing' ? 'Editing' : event.status === 'failed' ? 'Failed' : 'Edited'}</span>
+                        <span className="edit-file-name">{event.file.split('/').at(-1) ?? event.file}</span>
+                        <span className="edit-add">+{event.additions}</span>
+                        <span className="edit-delete">-{event.deletions}</span>
+                    </button>
+                    {event.preview.length > 0 && (
+                        <div className="edit-preview">
+                            <div className="edit-preview-header">
+                                <span>{event.file.split('/').at(-1) ?? event.file}</span>
+                                <span className="edit-add">+{event.additions}</span>
+                                <span className="edit-delete">-{event.deletions}</span>
+                            </div>
+                            <div className="edit-preview-code">
+                                {event.preview.map((line, index) => (
+                                    <div key={`${line.lineNo}-${index}`} className={`edit-preview-row edit-preview-row--${line.type}`}>
+                                        <span className="edit-preview-line-no">{line.lineNo}</span>
+                                        <code>{line.text || ' '}</code>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            ))}
+            {events.length > 1 && (
+                <div className="edit-total">
+                    <span>Total</span>
+                    <span className="edit-add">+{totalAdded}</span>
+                    <span className="edit-delete">-{totalDeleted}</span>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function EditPencilIcon(): React.ReactElement {
+    return (
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path d="m4 12.8-.7 2.7 2.7-.7 8.1-8.1a1.9 1.9 0 0 0-2.7-2.7L4 12.8Z" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
         </svg>
     );
 }

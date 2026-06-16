@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { MessageParam, ImageBlockParam } from '@anthropic-ai/sdk/resources/messages';
 import { SecurityFilter } from './securityFilter';
 import { WorkspaceIndexer } from './workspaceIndexer';
 
@@ -6,7 +7,7 @@ export type Mode = 'ask' | 'analyze' | 'edit';
 
 export interface ConversationMessage {
     role: 'user' | 'assistant';
-    content: string;
+    content: MessageParam['content'];
 }
 
 export interface RequestContext {
@@ -14,6 +15,7 @@ export interface RequestContext {
     selection?: string;
     projectTree?: string;
     attachedFiles?: Array<{ fsPath: string; content: string }>;
+    attachedImages?: Array<{ label: string; mimeType: ImageBlockParam.Source['media_type']; dataBase64: string }>;
     searchResults?: string;
     fileBundle?: string;   // multiple related files merged
 }
@@ -99,15 +101,35 @@ export class ContextBuilder {
             }
         }
 
+        if (ctx.attachedImages?.length) {
+            systemParts.push(
+                `\n## Attached Images\n${ctx.attachedImages.map(image => `- ${image.label} (${image.mimeType})`).join('\n')}`,
+            );
+        }
+
         if (ctx.searchResults) {
             systemParts.push(`\n## Workspace Search Results\n${ctx.searchResults}`);
         }
 
         const trimmedHistory = history.slice(-MAX_HISTORY_MESSAGES);
 
+        const userContent: MessageParam['content'] = ctx.attachedImages?.length
+            ? [
+                { type: 'text', text: userMessage },
+                ...ctx.attachedImages.map(image => ({
+                    type: 'image' as const,
+                    source: {
+                        type: 'base64' as const,
+                        media_type: image.mimeType,
+                        data: image.dataBase64,
+                    },
+                })),
+            ]
+            : userMessage;
+
         return {
             system: systemParts.join('\n'),
-            messages: [...trimmedHistory, { role: 'user', content: userMessage }],
+            messages: [...trimmedHistory, { role: 'user', content: userContent }],
         };
     }
 

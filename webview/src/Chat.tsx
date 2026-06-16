@@ -1,6 +1,6 @@
-import React, { useRef, useEffect, useState, type FormEvent, type KeyboardEvent } from 'react';
+import React, { useRef, useEffect, useState, type DragEvent, type FormEvent, type KeyboardEvent } from 'react';
 import Message from './Message';
-import { MODEL_INFO, type ChatMessage, type ContextInfo, type ContextScope, type ModelId, type Mode, MODE_INFO } from './types';
+import { MODEL_INFO, type AttachedFile, type ChatMessage, type ContextInfo, type ContextScope, type ModelId, type Mode, MODE_INFO } from './types';
 
 interface Props {
     messages:      ChatMessage[];
@@ -14,16 +14,25 @@ interface Props {
     onModeChange:  (mode: Mode) => void;
     contextScopes: ContextScope[];
     onToggleContextScope: (scope: ContextScope) => void;
+    attachedFiles: AttachedFile[];
+    onAttachFiles: (files: AttachedFile[]) => void;
+    onPickFiles: () => void;
+    onRemoveAttachedFile: (id: string) => void;
 }
 
 export default function Chat({
     messages, isStreaming, onSend, onStop, contextInfo,
     selectedModel, onModelChange, mode, onModeChange,
     contextScopes, onToggleContextScope,
+    attachedFiles, onAttachFiles, onPickFiles, onRemoveAttachedFile,
 }: Props): React.ReactElement {
     const [input,        setInput]       = useState('');
     const [showModeMenu, setShowModeMenu] = useState(false);
     const [showContextMenu, setShowContextMenu] = useState(false);
+    const [showPlusMenu, setShowPlusMenu] = useState(false);
+    const [showLocalMenu, setShowLocalMenu] = useState(false);
+    const [pursueGoal, setPursueGoal] = useState(false);
+    const [isDraggingImages, setIsDraggingImages] = useState(false);
     const bottomRef    = useRef<HTMLDivElement>(null);
     const messagesRef  = useRef<HTMLDivElement>(null);
     const isAtBottom   = useRef(true);
@@ -58,9 +67,42 @@ export default function Chat({
     const tokenLabel = contextInfo
         ? `${Math.max(1, Math.round(contextInfo.tokens / 100) / 10)}k`
         : '0k';
+    const includeIdeContext = contextScopes.includes('workspace');
+    const planMode = mode === 'analyze';
+
+    const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+        if (!hasImageFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'copy';
+        setIsDraggingImages(true);
+    };
+
+    const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        setIsDraggingImages(false);
+    };
+
+    const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+        if (!hasImageFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        setIsDraggingImages(false);
+        void readDroppedImages(event.dataTransfer.files).then(files => {
+            if (files.length > 0) onAttachFiles(files);
+        });
+    };
 
     return (
-        <div className="chat">
+        <div
+            className={`chat ${isDraggingImages ? 'chat--dragging' : ''}`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+        >
+            {isDraggingImages && (
+                <div className="drop-overlay" aria-hidden="true">
+                    <div>Drop images to attach</div>
+                </div>
+            )}
             <div className="messages" ref={messagesRef} onScroll={handleScroll}>
                 {messages.length === 0 && (
                     <div className="empty-state">
@@ -93,8 +135,92 @@ export default function Chat({
                         disabled={isStreaming}
                     />
 
+                    {attachedFiles.length > 0 && (
+                        <div className="composer-attachments">
+                            {attachedFiles.map(file => (
+                                <button
+                                    key={attachmentId(file)}
+                                    type="button"
+                                    className={`composer-attachment ${file.dataBase64 ? 'composer-attachment--image' : ''}`}
+                                    title={file.fsPath ?? file.label}
+                                    onClick={() => onRemoveAttachedFile(attachmentId(file))}
+                                >
+                                    {file.dataBase64 && (
+                                        <img
+                                            src={`data:${file.mimeType};base64,${file.dataBase64}`}
+                                            alt=""
+                                        />
+                                    )}
+                                    <span>{file.label}</span>
+                                    <span aria-hidden="true">×</span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
+
                     {/* ─── Toolbar: matches screenshot ─── */}
                     <div className="input-toolbar">
+                        <div className="toolbar-plus-wrap">
+                            <button
+                                type="button"
+                                className="tool-btn toolbar-attach"
+                                title="Add"
+                                onClick={() => setShowPlusMenu(v => !v)}
+                            >
+                                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                                    <path d="M8 1v14M1 8h14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                                </svg>
+                            </button>
+
+                            {showPlusMenu && (
+                                <div className="plus-menu" onMouseLeave={() => setShowPlusMenu(false)}>
+                                    <button
+                                        type="button"
+                                        className="plus-menu-row"
+                                        onClick={() => { onPickFiles(); setShowPlusMenu(false); }}
+                                    >
+                                        <PaperclipIcon />
+                                        <span>Add photos & files</span>
+                                    </button>
+                                    <div className="plus-menu-divider" />
+                                    <button
+                                        type="button"
+                                        className="plus-menu-row"
+                                        onClick={() => onToggleContextScope('workspace')}
+                                    >
+                                        <SparkIcon />
+                                        <span>Include IDE context</span>
+                                        <Toggle enabled={includeIdeContext} />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="plus-menu-row"
+                                        onClick={() => onModeChange(planMode ? 'ask' : 'analyze')}
+                                    >
+                                        <PlanIcon />
+                                        <span>Plan mode</span>
+                                        <Toggle enabled={planMode} />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="plus-menu-row"
+                                        onClick={() => setPursueGoal(v => !v)}
+                                    >
+                                        <GoalIcon />
+                                        <span>Pursue goal</span>
+                                        <Toggle enabled={pursueGoal} />
+                                    </button>
+                                    <div className="plus-menu-divider" />
+                                    <button type="button" className="plus-menu-row plus-menu-row--plugins">
+                                        <PluginIcon />
+                                        <span>Plugins</span>
+                                        <ChevronRightIcon />
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="toolbar-divider" />
 
                         {/* Agent mode button */}
                         <div className="toolbar-mode-wrap">
@@ -213,16 +339,77 @@ export default function Chat({
             </form>
 
             <div className="chat-footer">
-                <svg width="15" height="13" viewBox="0 0 15 13" fill="none" aria-hidden="true">
-                    <path d="M2.1 2.1h10.8v7.2H2.1zM5.2 11h4.6M1 11h13" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-                <span>Work locally</span>
-                <svg width="9" height="6" viewBox="0 0 9 6" fill="none" aria-hidden="true">
-                    <path d="M1 1.2 4.5 4.7 8 1.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
+                <button
+                    type="button"
+                    className="work-local-btn"
+                    onClick={() => setShowLocalMenu(v => !v)}
+                    aria-expanded={showLocalMenu}
+                >
+                    <svg width="15" height="13" viewBox="0 0 15 13" fill="none" aria-hidden="true">
+                        <path d="M2.1 2.1h10.8v7.2H2.1zM5.2 11h4.6M1 11h13" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round"/>
+                    </svg>
+                    <span>Work locally</span>
+                    <svg width="9" height="6" viewBox="0 0 9 6" fill="none" aria-hidden="true">
+                        <path d="M1 1.2 4.5 4.7 8 1.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+                    </svg>
+                </button>
+                {showLocalMenu && (
+                    <div className="local-menu" onMouseLeave={() => setShowLocalMenu(false)}>
+                        <div className="local-menu-title">Local workspace</div>
+                        <div className="local-menu-row">
+                            <span>Files are read from VS Code</span>
+                            <span>On</span>
+                        </div>
+                        <div className="local-menu-row">
+                            <span>Cloud sync</span>
+                            <span>Off</span>
+                        </div>
+                        <div className="local-menu-row">
+                            <span>Model provider</span>
+                            <span>Anthropic</span>
+                        </div>
+                    </div>
+                )}
             </div>
         </div>
     );
+}
+
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const MAX_DROPPED_IMAGE_BYTES = 5_000_000;
+
+function attachmentId(file: AttachedFile): string {
+    return file.id ?? file.fsPath ?? `${file.label}-${file.mimeType ?? 'file'}`;
+}
+
+function hasImageFiles(dataTransfer: DataTransfer): boolean {
+    return Array.from(dataTransfer.items).some(item =>
+        item.kind === 'file' && IMAGE_TYPES.has(item.type),
+    );
+}
+
+async function readDroppedImages(fileList: FileList): Promise<AttachedFile[]> {
+    const files = Array.from(fileList)
+        .filter(file => IMAGE_TYPES.has(file.type) && file.size <= MAX_DROPPED_IMAGE_BYTES);
+
+    return Promise.all(files.map(async file => ({
+        id: `${file.name}-${file.size}-${file.lastModified}`,
+        label: file.name,
+        mimeType: file.type,
+        dataBase64: await readImageAsBase64(file),
+    })));
+}
+
+function readImageAsBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = String(reader.result ?? '');
+            resolve(result.includes(',') ? result.slice(result.indexOf(',') + 1) : result);
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
 }
 
 const CONTEXT_OPTIONS: Array<{ id: ContextScope; label: string }> = [
@@ -231,6 +418,65 @@ const CONTEXT_OPTIONS: Array<{ id: ContextScope; label: string }> = [
     { id: 'workspace', label: 'Workspace' },
     { id: 'search',    label: 'Search' },
 ];
+
+function Toggle({ enabled }: { enabled: boolean }): React.ReactElement {
+    return (
+        <span className={`plus-toggle ${enabled ? 'plus-toggle--on' : ''}`} aria-hidden="true">
+            <span />
+        </span>
+    );
+}
+
+function PaperclipIcon(): React.ReactElement {
+    return (
+        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M8.8 12.5v4.3a3.2 3.2 0 0 0 6.4 0V7.6a4.4 4.4 0 0 0-8.8 0v9.1a5.6 5.6 0 1 0 11.2 0V8.1" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+        </svg>
+    );
+}
+
+function SparkIcon(): React.ReactElement {
+    return (
+        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1M15.9 15.9 18 18M18 6l-2.1 2.1M8.1 15.9 6 18" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/>
+            <path d="m10.2 10 4.5 1.8-2.3 1.2 1.8 3.1-1.8 1-1.7-3.2-2 1.6L10.2 10Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
+        </svg>
+    );
+}
+
+function PlanIcon(): React.ReactElement {
+    return (
+        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4.5 7.5 6.2 9 9 5.5M4.5 16.5 6.2 18 9 14.5M12 7h7M12 17h7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+    );
+}
+
+function GoalIcon(): React.ReactElement {
+    return (
+        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.7"/>
+            <circle cx="12" cy="12" r="4.3" stroke="currentColor" strokeWidth="1.7"/>
+            <path d="M12 8.2v3.8l2.6 1.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+    );
+}
+
+function PluginIcon(): React.ReactElement {
+    return (
+        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M8.2 8.2a6.5 6.5 0 1 1-1.6 6.6M8.2 8.2H5.4M8.2 8.2v-3M8.2 15.8a4.7 4.7 0 0 0 7.6-3.7" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+    );
+}
+
+function ChevronRightIcon(): React.ReactElement {
+    return (
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path d="m7 4.5 4.5 4.5L7 13.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+    );
+}
 
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars

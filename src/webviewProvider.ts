@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import type { ImageBlockParam } from '@anthropic-ai/sdk/resources/messages';
 import { ClaudeClient, ModelId } from './claudeClient';
 import { ContextBuilder, ConversationMessage, RequestContext, Mode } from './contextBuilder';
 import { WorkspaceIndexer } from './workspaceIndexer';
@@ -8,6 +9,42 @@ import { UsageTracker } from './usageTracker';
 import { SessionManager, SavedSession } from './sessionManager';
 
 type ContextScope = 'file' | 'selection' | 'workspace' | 'search';
+type AttachedFileInput = {
+    fsPath?: unknown;
+    label?: unknown;
+    mimeType?: unknown;
+    dataBase64?: unknown;
+};
+
+type AttachedImage = {
+    label: string;
+    mimeType: ImageBlockParam.Source['media_type'];
+    dataBase64: string;
+};
+
+type EditPreviewLine = {
+    type: 'context' | 'add' | 'delete';
+    lineNo: number;
+    text: string;
+};
+
+type EditEvent = {
+    id: string;
+    file: string;
+    status: 'editing' | 'edited' | 'failed';
+    additions: number;
+    deletions: number;
+    preview: EditPreviewLine[];
+};
+
+const SUPPORTED_IMAGE_TYPES = new Set<ImageBlockParam.Source['media_type']>([
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+]);
+
+const MAX_PICKED_IMAGE_BYTES = 5_000_000;
 
 export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'softcodeAI.chatView';
@@ -85,6 +122,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                     String(msg['model']  ?? this.currentModel) as ModelId,
                     String(msg['mode']   ?? 'ask') as Mode,
                     (msg['contextScopes'] as ContextScope[]) ?? ['file', 'workspace'],
+                    (msg['attachedFiles'] as AttachedFileInput[]) ?? [],
                 );
                 break;
 
@@ -118,6 +156,10 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
             case 'searchWorkspace':
                 await this.handleSearch(String(msg['query'] ?? ''));
+                break;
+
+            case 'pickFiles':
+                await this.pickFiles();
                 break;
 
             // ── Session management ──────────────────────────────────────────
@@ -200,6 +242,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         model: ModelId,
         mode: Mode,
         scopes: ContextScope[],
+        attachments: AttachedFileInput[] = [],
     ): Promise<void> {
         if (!content.trim()) return;
 
@@ -217,7 +260,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
         // Build context with live status + todo updates
         const { ctx, contextInfo } = await this.buildSmartContext(
-            content, model, scopes, mode, msgId, updateTodo,
+            content, model, scopes, mode, msgId, updateTodo, attachments,
         );
 
         // Send context info so the indicator updates before the stream
@@ -266,6 +309,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         mode: Mode,
         msgId: string,
         updateTodo: (id: string, status: 'in-progress' | 'completed') => void,
+        attachments: AttachedFileInput[] = [],
     ): Promise<{ ctx: RequestContext; contextInfo: { files: string[]; tokens: number; estimatedCost: number } }> {
         const ctx: RequestContext = {};
         const attachedFiles: string[] = [];
@@ -302,6 +346,32 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 status(`✂️  Selection included`);
             }
             updateTodo('read-selection', 'completed');
+        }
+
+        // ── 3. Explicit attachments ─────────────────────────────────────────
+        if (attachments.length > 0) {
+            const attachedFilePaths = attachments
+                .map(file => String(file.fsPath ?? ''))
+                .filter(Boolean);
+            const attachedImages = this.extractAttachedImages(attachments);
+
+            status(`Attaching ${attachments.length} item${attachments.length > 1 ? 's' : ''}...`);
+            const files = await Promise.all(attachedFilePaths.map(async fsPath => {
+                const content = await this.indexer.readFile(fsPath);
+                return content ? { fsPath, content } : undefined;
+            }));
+            ctx.attachedFiles = files.filter((file): file is { fsPath: string; content: string } => Boolean(file));
+            ctx.attachedImages = attachedImages;
+
+            const rootPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+            const relPaths = ctx.attachedFiles.map(file =>
+                rootPath ? path.relative(rootPath, file.fsPath) : path.basename(file.fsPath),
+            );
+            const imageLabels = attachedImages.map(image => image.label);
+            attachedFiles.push(...relPaths, ...imageLabels);
+            if (attachedFiles.length > 0) {
+                this.post({ type: 'agentFiles', msgId, files: attachedFiles });
+            }
         }
 
         // ── 3. Project tree ──────────────────────────────────────────────────
@@ -376,6 +446,8 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             ctx.projectTree ?? '',
             ctx.activeFile?.content ?? '',
             ctx.selection ?? '',
+            ctx.attachedFiles?.map(file => file.content).join('\n') ?? '',
+            ctx.attachedImages?.map(image => image.label).join('\n') ?? '',
             ctx.fileBundle ?? '',
             ctx.searchResults ?? '',
         ].join('');
@@ -441,7 +513,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
                 // In edit mode, automatically apply the generated patches to disk
                 if (mode === 'edit') {
-                    void this.applyEditPatches(fullResponse);
+                    void this.applyEditPatches(fullResponse, msgId);
                 }
 
             },
@@ -475,7 +547,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
      *   <full file content>
      *   ```
      */
-    private async applyEditPatches(response: string): Promise<void> {
+    private async applyEditPatches(response: string, msgId: string): Promise<void> {
         const EDIT_RE = /```[\w.-]*\n\/\/ @@softcode-edit:\s*(.+?)\n([\s\S]*?)```/g;
         const edits: Array<{ relPath: string; content: string }> = [];
         let m: RegExpExecArray | null;
@@ -507,6 +579,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
         const wsEdit = new vscode.WorkspaceEdit();
         const applied: string[] = [];
+        const events: EditEvent[] = [];
 
         for (const { relPath, content } of edits) {
             const fullPath = this.resolveWorkspacePath(rootPath, relPath);
@@ -515,6 +588,12 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 continue;
             }
             const uri = vscode.Uri.file(fullPath);
+            const oldText = await this.readExistingText(uri);
+            const event = this.buildEditEvent(relPath, oldText ?? '', content, 'editing');
+            events.push(event);
+            this.hasCompletedTurnPendingSave = true;
+            this.post({ type: 'editEvent', msgId, event });
+
             try {
                 const doc = await vscode.workspace.openTextDocument(uri);
                 const fullRange = new vscode.Range(
@@ -533,6 +612,15 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         const success = await vscode.workspace.applyEdit(wsEdit);
+        for (const event of events) {
+            this.hasCompletedTurnPendingSave = true;
+            this.post({
+                type: 'editEvent',
+                msgId,
+                event: { ...event, status: success ? 'edited' : 'failed' },
+            });
+        }
+
         if (success && applied.length > 0) {
             const label = applied.join(', ');
             void vscode.window.showInformationMessage(
@@ -542,6 +630,101 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             const firstUri = vscode.Uri.file(path.join(rootPath, applied[0]));
             void vscode.window.showTextDocument(firstUri, { preserveFocus: true, preview: false });
         }
+    }
+
+    private async readExistingText(uri: vscode.Uri): Promise<string | undefined> {
+        try {
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            return Buffer.from(bytes).toString('utf8');
+        } catch {
+            return undefined;
+        }
+    }
+
+    private buildEditEvent(
+        relPath: string,
+        oldText: string,
+        newText: string,
+        status: EditEvent['status'],
+    ): EditEvent {
+        const diff = this.diffLines(oldText, newText);
+        return {
+            id: relPath,
+            file: relPath,
+            status,
+            additions: diff.additions,
+            deletions: diff.deletions,
+            preview: diff.preview,
+        };
+    }
+
+    private diffLines(
+        oldText: string,
+        newText: string,
+    ): { additions: number; deletions: number; preview: EditPreviewLine[] } {
+        const oldLines = oldText.split('\n');
+        const newLines = newText.split('\n');
+        if (oldLines.at(-1) === '') oldLines.pop();
+        if (newLines.at(-1) === '') newLines.pop();
+
+        const maxMatrixCells = 90_000;
+        if (oldLines.length * newLines.length > maxMatrixCells) {
+            return this.simpleLineDiff(oldLines, newLines);
+        }
+
+        const table: number[][] = Array.from({ length: oldLines.length + 1 }, () =>
+            Array(newLines.length + 1).fill(0),
+        );
+
+        for (let i = oldLines.length - 1; i >= 0; i--) {
+            for (let j = newLines.length - 1; j >= 0; j--) {
+                table[i][j] = oldLines[i] === newLines[j]
+                    ? table[i + 1][j + 1] + 1
+                    : Math.max(table[i + 1][j], table[i][j + 1]);
+            }
+        }
+
+        const preview: EditPreviewLine[] = [];
+        let additions = 0;
+        let deletions = 0;
+        let i = 0;
+        let j = 0;
+
+        while (i < oldLines.length || j < newLines.length) {
+            if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
+                if (preview.length < 8 && (additions > 0 || deletions > 0)) {
+                    preview.push({ type: 'context', lineNo: j + 1, text: oldLines[i] });
+                }
+                i++;
+                j++;
+            } else if (j < newLines.length && (i === oldLines.length || table[i][j + 1] >= table[i + 1][j])) {
+                additions++;
+                if (preview.length < 8) {
+                    preview.push({ type: 'add', lineNo: j + 1, text: newLines[j] });
+                }
+                j++;
+            } else if (i < oldLines.length) {
+                deletions++;
+                if (preview.length < 8) {
+                    preview.push({ type: 'delete', lineNo: i + 1, text: oldLines[i] });
+                }
+                i++;
+            }
+        }
+
+        return { additions, deletions, preview };
+    }
+
+    private simpleLineDiff(
+        oldLines: string[],
+        newLines: string[],
+    ): { additions: number; deletions: number; preview: EditPreviewLine[] } {
+        const additions = Math.max(0, newLines.length - oldLines.length);
+        const deletions = Math.max(0, oldLines.length - newLines.length);
+        const preview = newLines
+            .slice(0, 6)
+            .map((text, index) => ({ type: 'context' as const, lineNo: index + 1, text }));
+        return { additions, deletions, preview };
     }
 
     private resolveWorkspacePath(rootPath: string, relPath: string): string | undefined {
@@ -603,6 +786,77 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         this.post({ type: 'searchResults', files, content });
     }
 
+    private async pickFiles(): Promise<void> {
+        const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: true,
+            openLabel: 'Attach',
+        });
+        if (!uris?.length) return;
+
+        const rootPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+        const files = await Promise.all(uris.map(async uri => {
+            const label = rootPath ? path.relative(rootPath, uri.fsPath) : path.basename(uri.fsPath);
+            const mimeType = this.mimeTypeForImagePath(uri.fsPath);
+            if (mimeType) {
+                const bytes = await vscode.workspace.fs.readFile(uri);
+                if (bytes.byteLength <= MAX_PICKED_IMAGE_BYTES) {
+                    return {
+                        fsPath: uri.fsPath,
+                        label,
+                        mimeType,
+                        dataBase64: Buffer.from(bytes).toString('base64'),
+                    };
+                }
+            }
+
+            return { fsPath: uri.fsPath, label };
+        }));
+
+        this.post({
+            type: 'filesPicked',
+            files,
+        });
+    }
+
+    private extractAttachedImages(attachments: AttachedFileInput[]): AttachedImage[] {
+        return attachments
+            .map(attachment => {
+                const mimeType = String(attachment.mimeType ?? '');
+                if (!SUPPORTED_IMAGE_TYPES.has(mimeType as ImageBlockParam.Source['media_type'])) {
+                    return undefined;
+                }
+
+                const dataBase64 = String(attachment.dataBase64 ?? '');
+                if (!dataBase64) return undefined;
+
+                return {
+                    label: String(attachment.label ?? 'Image'),
+                    mimeType: mimeType as ImageBlockParam.Source['media_type'],
+                    dataBase64,
+                };
+            })
+            .filter((image): image is AttachedImage => Boolean(image));
+    }
+
+    private mimeTypeForImagePath(fsPath: string): ImageBlockParam.Source['media_type'] | undefined {
+        const ext = path.extname(fsPath).toLowerCase();
+        switch (ext) {
+            case '.jpg':
+            case '.jpeg':
+                return 'image/jpeg';
+            case '.png':
+                return 'image/png';
+            case '.gif':
+                return 'image/gif';
+            case '.webp':
+                return 'image/webp';
+            default:
+                return undefined;
+        }
+    }
+
     // ─── Session auto-save ───────────────────────────────────────────────────
 
     /**
@@ -638,12 +892,14 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
         // Derive title from first user message
         const firstUser = this.conversationHistory.find(m => m.role === 'user');
+        const firstUserText = firstUser ? this.messageContentText(firstUser.content) : '';
         const title = firstUser
-            ? firstUser.content.slice(0, 60) + (firstUser.content.length > 60 ? '…' : '')
+            ? firstUserText.slice(0, 60) + (firstUserText.length > 60 ? '…' : '')
             : 'New session';
         const preview = this.conversationHistory
             .filter(m => m.role === 'assistant')
-            .at(-1)?.content.slice(0, 80) ?? '';
+            .map(m => this.messageContentText(m.content))
+            .at(-1)?.slice(0, 80) ?? '';
 
         const session: SavedSession = {
             id:        this.currentSessionId,
@@ -655,6 +911,16 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         };
         await this.sessionManager.save(session);
         this.post({ type: 'sessions', list: this.sessionManager.list() });
+    }
+
+    private messageContentText(content: ConversationMessage['content']): string {
+        if (typeof content === 'string') {
+            return content;
+        }
+
+        return content
+            .map(block => block.type === 'text' ? block.text : `[${block.type}]`)
+            .join(' ');
     }
 
     // ─── External command triggers ───────────────────────────────────────────

@@ -6,8 +6,10 @@ import {
     type ModelId,
     type Mode,
     type ContextScope,
+    type AttachedFile,
     type ChatMessage,
     type ContextInfo,
+    type EditEvent,
     type UsageStats,
     type PlanTodo,
     type TodoStatus,
@@ -45,6 +47,7 @@ export default function App(): React.ReactElement {
     const [stats,          setStats]          = useState<UsageStats | null>(null);
     const [liveContext,    setLiveContext]     = useState<ContextInfo | null>(null);
     const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
+    const [attachedFiles,  setAttachedFiles]  = useState<AttachedFile[]>([]);
 
     // ─── Extension message bridge ─────────────────────────────────────────
     useEffect(() => {
@@ -106,6 +109,20 @@ export default function App(): React.ReactElement {
                             ? { ...m, plan: m.plan?.map(t => t.id === todoId ? { ...t, status } : t) }
                             : m,
                     ));
+                    break;
+                }
+
+                case 'editEvent': {
+                    const msgId = String(msg['msgId']);
+                    const event = msg['event'] as EditEvent;
+                    setMessages(prev => prev.map(m => {
+                        if (m.id !== msgId) return m;
+                        const existing = m.editEvents ?? [];
+                        const next = existing.some(e => e.id === event.id)
+                            ? existing.map(e => e.id === event.id ? event : e)
+                            : [...existing, event];
+                        return { ...m, editEvents: next };
+                    }));
                     break;
                 }
 
@@ -175,6 +192,19 @@ export default function App(): React.ReactElement {
                     setSessions(msg['list'] as SessionMeta[]);
                     break;
 
+                case 'filesPicked': {
+                    const files = msg['files'] as AttachedFile[];
+                    setAttachedFiles(prev => {
+                        const byPath = new Map(prev.map(file => [file.fsPath, file]));
+                        files.forEach(file => byPath.set(
+                            file.fsPath,
+                            { ...file, id: file.id ?? file.fsPath ?? `${file.label}-${Date.now()}` },
+                        ));
+                        return [...byPath.values()];
+                    });
+                    break;
+                }
+
                 case 'sessionLoaded': {
                     const s = msg['session'] as { messages: ChatMessage[] };
                     const loadedMessages = s.messages ?? [];
@@ -217,6 +247,7 @@ export default function App(): React.ReactElement {
             { id: `u-${Date.now()}`, role: 'user', content },
         ]);
         setLiveContext(null);
+        setAttachedFiles([]);
 
         vscode.postMessage({
             type:          'send',
@@ -224,8 +255,9 @@ export default function App(): React.ReactElement {
             model:         selectedModel,
             mode,
             contextScopes,
+            attachedFiles,
         });
-    }, [isStreaming, selectedModel, mode, contextScopes]);
+    }, [isStreaming, selectedModel, mode, contextScopes, attachedFiles]);
 
     const handleClear = useCallback(() => {
         setMessages([]);
@@ -256,6 +288,22 @@ export default function App(): React.ReactElement {
         vscode.postMessage({ type: 'deleteSession', id });
     }, []);
 
+    const handlePickFiles = useCallback(() => {
+        vscode.postMessage({ type: 'pickFiles' });
+    }, []);
+
+    const handleAttachFiles = useCallback((files: AttachedFile[]) => {
+        setAttachedFiles(prev => {
+            const byId = new Map(prev.map(file => [file.id ?? file.fsPath ?? file.label, file]));
+            files.forEach(file => byId.set(file.id ?? file.fsPath ?? file.label, file));
+            return [...byId.values()];
+        });
+    }, []);
+
+    const handleRemoveAttachedFile = useCallback((id: string) => {
+        setAttachedFiles(prev => prev.filter(file => (file.id ?? file.fsPath ?? file.label) !== id));
+    }, []);
+
     const toggleScope = useCallback((scope: ContextScope) => {
         setContextScopes(prev =>
             prev.includes(scope) ? prev.filter(s => s !== scope) : [...prev, scope],
@@ -280,21 +328,23 @@ export default function App(): React.ReactElement {
                         aria-label="Chat history"
                         onClick={() => { setShowHistory(h => !h); setShowSettings(false); }}
                     >
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <path d="M3.4 5.4A5.2 5.2 0 1 1 3 10.2M3.4 5.4H1.2M3.4 5.4V3.2" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round"/>
+                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                            <path d="M4.7 7.2A6 6 0 1 1 4.3 12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+                            <path d="M4.7 7.2H2.3M4.7 7.2V4.8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
                         </svg>
                     </button>
                     {/* Settings */}
                     <button className="icon-btn" onClick={handleShowSettings} title="Settings" aria-label="Settings">
-                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                            <path fillRule="evenodd" d="M9.1 4.4 8.1 2H7.9L6.9 4.4 4.2 4.9 2.4 6.6l.8 2.5-.8 2.5 1.8 1.7 2.7.5 1 2.4h.2l1-2.4 2.7-.5 1.8-1.7-.8-2.5.8-2.5-1.8-1.7-2.7-.5zM8 10a2 2 0 1 1 0-4 2 2 0 0 1 0 4z"/>
+                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                            <path d="M8.9 2.7h2.2l.5 2.1c.5.2.9.4 1.3.7l2-.7 1.1 1.9-1.6 1.4c.1.5.1 1 .1 1.5l1.6 1.4-1.1 1.9-2-.7c-.4.3-.8.5-1.3.7l-.5 2.1H8.9l-.5-2.1c-.5-.2-.9-.4-1.3-.7l-2 .7L4 11l1.6-1.4c-.1-.5-.1-1 0-1.5L4 6.7l1.1-1.9 2 .7c.4-.3.8-.5 1.3-.7l.5-2.1Z" stroke="currentColor" strokeWidth="1.55" strokeLinejoin="round"/>
+                            <circle cx="10" cy="8.9" r="2.35" stroke="currentColor" strokeWidth="1.55"/>
                         </svg>
                     </button>
                     {/* Clear / New chat */}
                     <button className="icon-btn" onClick={handleClear} title="New chat" aria-label="New chat">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <path d="M8.8 3H3.4A1.4 1.4 0 0 0 2 4.4v8.2A1.4 1.4 0 0 0 3.4 14h8.2a1.4 1.4 0 0 0 1.4-1.4V7.2" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round"/>
-                            <path d="M11.3 2.3a1.35 1.35 0 0 1 1.9 1.9L7.6 9.8 5 10.5l.7-2.6 5.6-5.6Z" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round"/>
+                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                            <path d="M10.8 4H5.2A1.7 1.7 0 0 0 3.5 5.7v9.1a1.7 1.7 0 0 0 1.7 1.7h9.1a1.7 1.7 0 0 0 1.7-1.7V9.2" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round"/>
+                            <path d="M14.6 2.9a1.45 1.45 0 0 1 2.1 2.1l-6.2 6.2-2.8.7.7-2.8 6.2-6.2Z" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round"/>
                         </svg>
                     </button>
                     {/* Close */}
@@ -418,6 +468,10 @@ export default function App(): React.ReactElement {
                 onStop={handleStop}
                 contextScopes={contextScopes}
                 onToggleContextScope={toggleScope}
+                attachedFiles={attachedFiles}
+                onAttachFiles={handleAttachFiles}
+                onPickFiles={handlePickFiles}
+                onRemoveAttachedFile={handleRemoveAttachedFile}
             />
         </div>
     );

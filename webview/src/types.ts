@@ -21,6 +21,14 @@ export interface MessageAction {
     action:   string;
 }
 
+export interface AttachedFile {
+    id?:         string;
+    fsPath?:     string;
+    label:       string;
+    mimeType?:   string;
+    dataBase64?: string;
+}
+
 export const MODE_INFO: Record<Mode, { label: string; description: string }> = {
     ask:     { label: 'Ask',     description: 'Answer questions'    },
     analyze: { label: 'Analyze', description: 'Find bugs & issues'  },
@@ -33,6 +41,21 @@ export interface ContextInfo {
     estimatedCost: number;
 }
 
+export interface EditPreviewLine {
+    type:   'context' | 'add' | 'delete';
+    lineNo: number;
+    text:   string;
+}
+
+export interface EditEvent {
+    id:        string;
+    file:      string;
+    status:    'editing' | 'edited' | 'failed';
+    additions: number;
+    deletions: number;
+    preview:   EditPreviewLine[];
+}
+
 export interface ChatMessage {
     id:           string;
     role:         'user' | 'assistant';
@@ -41,6 +64,7 @@ export interface ChatMessage {
     statuses?:    string[];      // agent thinking steps
     foundFiles?:  string[];      // files discovered
     plan?:        PlanTodo[];    // structured execution plan
+    editEvents?:  EditEvent[];
     contextInfo?: ContextInfo;   // context summary at bottom
     actions?:     MessageAction[]; // action buttons below AI response
     sources?:     string[];        // source file links below AI response
