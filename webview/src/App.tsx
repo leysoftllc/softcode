@@ -1,5 +1,25 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import {
+    Archive,
+    ArrowLeft,
+    Check,
+    ChevronRight,
+    Copy,
+    MoreHorizontal,
+    Pencil,
+    RotateCcw,
+    Settings,
+    SquarePen,
+} from 'lucide-react';
 import Chat from './Chat';
+import { Button } from './components/ui/button';
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuSeparator,
+    DropdownMenuTrigger,
+} from './components/ui/dropdown-menu';
 import {
     vscode,
     MODEL_INFO,
@@ -34,6 +54,49 @@ function formatHistoryAge(timestamp: number): string {
     return `${Math.floor(hours / 24)}d`;
 }
 
+function formatConversation(messages: ChatMessage[]): string {
+    return messages
+        .map(message => {
+            const author = message.role === 'assistant' ? 'SoftCode AI' : 'You';
+            const parts = [`${author}:`];
+
+            if (message.content.trim()) {
+                parts.push(message.content.trim());
+            }
+
+            if (message.plan && message.plan.length > 0) {
+                parts.push([
+                    'Todos:',
+                    ...message.plan.map(todo => `- [${todo.status}] ${todo.text}`),
+                ].join('\n'));
+            }
+
+            if (message.foundFiles && message.foundFiles.length > 0) {
+                parts.push(`Files: ${message.foundFiles.join(', ')}`);
+            }
+
+            return parts.join('\n');
+        })
+        .filter(Boolean)
+        .join('\n\n---\n\n');
+}
+
+async function copyToClipboard(text: string): Promise<void> {
+    if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    textarea.remove();
+}
+
 export default function App(): React.ReactElement {
     const [messages,       setMessages]       = useState<ChatMessage[]>([]);
     const [isStreaming,    setIsStreaming]     = useState(false);
@@ -48,6 +111,10 @@ export default function App(): React.ReactElement {
     const [liveContext,    setLiveContext]     = useState<ContextInfo | null>(null);
     const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
     const [attachedFiles,  setAttachedFiles]  = useState<AttachedFile[]>([]);
+    const [didCopyConversation, setDidCopyConversation] = useState(false);
+    const [chatTitle, setChatTitle] = useState('New chat');
+    const [showRenameDialog, setShowRenameDialog] = useState(false);
+    const [renameInput, setRenameInput] = useState('New chat');
 
     // ─── Extension message bridge ─────────────────────────────────────────
     useEffect(() => {
@@ -206,12 +273,13 @@ export default function App(): React.ReactElement {
                 }
 
                 case 'sessionLoaded': {
-                    const s = msg['session'] as { messages: ChatMessage[] };
+                    const s = msg['session'] as { messages: ChatMessage[]; title?: string };
                     const loadedMessages = s.messages ?? [];
                     const lastContext = [...loadedMessages]
                         .reverse()
                         .find(m => m.contextInfo)?.contextInfo ?? null;
                     setMessages(loadedMessages.map(m => ({ ...m, isStreaming: false })));
+                    setChatTitle(s.title ?? loadedMessages.find(m => m.role === 'user')?.content.slice(0, 44) ?? 'New chat');
                     setLiveContext(lastContext);
                     setIsStreaming(false);
                     setStreamingMsgId(null);
@@ -240,12 +308,14 @@ export default function App(): React.ReactElement {
     // ─── Actions ─────────────────────────────────────────────────────────
     const handleSend = useCallback((content: string) => {
         if (!content.trim() || isStreaming) return;
+        const firstMessage = messages.length === 0;
 
         // Add user message locally
         setMessages(prev => [
             ...prev,
             { id: `u-${Date.now()}`, role: 'user', content },
         ]);
+        if (firstMessage) setChatTitle(content.trim().slice(0, 44));
         setLiveContext(null);
         setAttachedFiles([]);
 
@@ -257,11 +327,59 @@ export default function App(): React.ReactElement {
             contextScopes,
             attachedFiles,
         });
-    }, [isStreaming, selectedModel, mode, contextScopes, attachedFiles]);
+    }, [isStreaming, messages.length, selectedModel, mode, contextScopes, attachedFiles]);
+
+    const handleResubmitMessage = useCallback((messageId: string, content: string) => {
+        const trimmed = content.trim();
+        if (!trimmed || isStreaming) return;
+
+        const index = messages.findIndex(message => message.id === messageId && message.role === 'user');
+        if (index < 0) return;
+
+        const previousMessages = messages.slice(0, index);
+        const editedMessage: ChatMessage = {
+            id: messageId,
+            role: 'user',
+            content: trimmed,
+        };
+        const nextMessages = [...previousMessages, editedMessage];
+        const history = previousMessages
+            .filter(message => message.role === 'user' || message.role === 'assistant')
+            .map(message => ({ role: message.role, content: message.content }));
+
+        setMessages(nextMessages);
+        setLiveContext(null);
+        setAttachedFiles([]);
+
+        vscode.postMessage({
+            type: 'resubmit',
+            content: trimmed,
+            model: selectedModel,
+            mode,
+            contextScopes,
+            attachedFiles,
+            history,
+            messages: nextMessages,
+        });
+    }, [isStreaming, messages, selectedModel, mode, contextScopes, attachedFiles]);
+
+    const handleRetryAssistant = useCallback((messageId: string) => {
+        if (isStreaming) return;
+        const assistantIndex = messages.findIndex(message => message.id === messageId && message.role === 'assistant');
+        if (assistantIndex <= 0) return;
+
+        const previousUser = [...messages.slice(0, assistantIndex)]
+            .reverse()
+            .find(message => message.role === 'user');
+        if (!previousUser) return;
+
+        handleResubmitMessage(previousUser.id, previousUser.content);
+    }, [handleResubmitMessage, isStreaming, messages]);
 
     const handleClear = useCallback(() => {
         setMessages([]);
         setLiveContext(null);
+        setChatTitle('New chat');
         vscode.postMessage({ type: 'newSession' });
     }, []);
 
@@ -315,42 +433,162 @@ export default function App(): React.ReactElement {
         setShowSettings(s => !s);
     }, []);
 
+    const handleCopyConversation = useCallback(() => {
+        if (messages.length === 0) return;
+
+        void copyToClipboard(formatConversation(messages)).then(() => {
+            setDidCopyConversation(true);
+            window.setTimeout(() => setDidCopyConversation(false), 1400);
+        });
+    }, [messages]);
+
+    const handleOpenRename = useCallback(() => {
+        setRenameInput(chatTitle);
+        setShowRenameDialog(true);
+    }, [chatTitle]);
+
+    const handleSaveRename = useCallback(() => {
+        const title = renameInput.trim();
+        if (!title) return;
+        setChatTitle(title);
+        setShowRenameDialog(false);
+        vscode.postMessage({ type: 'renameSession', title });
+    }, [renameInput]);
+
+    const handleArchiveChat = useCallback(() => {
+        vscode.postMessage({ type: 'archiveSession' });
+        setMessages([]);
+        setLiveContext(null);
+        setChatTitle('New chat');
+    }, []);
+
     return (
         <div className={`app ${showHistory ? 'app--history-open' : ''}`}>
             {/* Header */}
             <header className="app-header">
-                <div className="header-title">Copilot Chat</div>
+                <div className="header-title">
+                    <Button
+                        type="button"
+                        variant="icon"
+                        size="icon"
+                        className="icon-btn header-back-btn"
+                        title="Back"
+                        aria-label="Back"
+                        onClick={() => setShowHistory(false)}
+                    >
+                        <ArrowLeft size={18} strokeWidth={1.8} aria-hidden="true" />
+                    </Button>
+                    <span>{chatTitle}</span>
+                </div>
                 <div className="header-actions">
-                    {/* History */}
-                    <button
+                    <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                            <Button
+                                type="button"
+                                variant="icon"
+                                size="icon"
+                                className="icon-btn"
+                                title="Chat menu"
+                                aria-label="Chat menu"
+                            >
+                                <MoreHorizontal size={18} strokeWidth={1.8} aria-hidden="true" />
+                            </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent className="chat-menu" align="end" side="bottom">
+                            <DropdownMenuItem className="chat-menu-item" onSelect={handleOpenRename}>
+                                <Pencil size={16} strokeWidth={1.8} aria-hidden="true" />
+                                <span>Rename chat</span>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem className="chat-menu-item" onSelect={handleArchiveChat}>
+                                <Archive size={16} strokeWidth={1.8} aria-hidden="true" />
+                                <span>Archive chat</span>
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator className="chat-menu-separator" />
+                            <DropdownMenuItem
+                                className="chat-menu-item"
+                                disabled={messages.length === 0}
+                                onSelect={handleCopyConversation}
+                            >
+                                <Copy size={16} strokeWidth={1.8} aria-hidden="true" />
+                                <span>Copy</span>
+                                <ChevronRight size={16} strokeWidth={1.8} aria-hidden="true" />
+                            </DropdownMenuItem>
+                        </DropdownMenuContent>
+                    </DropdownMenu>
+                    <Button
+                        type="button"
+                        variant="icon"
+                        size="icon"
                         className={`icon-btn ${showHistory ? 'active' : ''}`}
                         title="Chat history"
                         aria-label="Chat history"
                         onClick={() => { setShowHistory(h => !h); setShowSettings(false); }}
                     >
-                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                            <path d="M4.7 7.2A6 6 0 1 1 4.3 12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-                            <path d="M4.7 7.2H2.3M4.7 7.2V4.8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-                        </svg>
-                    </button>
+                        <RotateCcw size={18} strokeWidth={1.8} aria-hidden="true" />
+                    </Button>
                     {/* Settings */}
-                    <button className="icon-btn" onClick={handleShowSettings} title="Settings" aria-label="Settings">
-                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                            <path d="M8.9 2.7h2.2l.5 2.1c.5.2.9.4 1.3.7l2-.7 1.1 1.9-1.6 1.4c.1.5.1 1 .1 1.5l1.6 1.4-1.1 1.9-2-.7c-.4.3-.8.5-1.3.7l-.5 2.1H8.9l-.5-2.1c-.5-.2-.9-.4-1.3-.7l-2 .7L4 11l1.6-1.4c-.1-.5-.1-1 0-1.5L4 6.7l1.1-1.9 2 .7c.4-.3.8-.5 1.3-.7l.5-2.1Z" stroke="currentColor" strokeWidth="1.55" strokeLinejoin="round"/>
-                            <circle cx="10" cy="8.9" r="2.35" stroke="currentColor" strokeWidth="1.55"/>
-                        </svg>
-                    </button>
+                    <Button
+                        type="button"
+                        variant="icon"
+                        size="icon"
+                        className="icon-btn"
+                        onClick={handleShowSettings}
+                        title="Settings"
+                        aria-label="Settings"
+                    >
+                        <Settings size={18} strokeWidth={1.8} aria-hidden="true" />
+                    </Button>
                     {/* Clear / New chat */}
-                    <button className="icon-btn" onClick={handleClear} title="New chat" aria-label="New chat">
-                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                            <path d="M10.8 4H5.2A1.7 1.7 0 0 0 3.5 5.7v9.1a1.7 1.7 0 0 0 1.7 1.7h9.1a1.7 1.7 0 0 0 1.7-1.7V9.2" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round"/>
-                            <path d="M14.6 2.9a1.45 1.45 0 0 1 2.1 2.1l-6.2 6.2-2.8.7.7-2.8 6.2-6.2Z" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round"/>
-                        </svg>
-                    </button>
+                    <Button
+                        type="button"
+                        variant="icon"
+                        size="icon"
+                        className="icon-btn"
+                        onClick={handleClear}
+                        title="New chat"
+                        aria-label="New chat"
+                    >
+                        <SquarePen size={18} strokeWidth={1.8} aria-hidden="true" />
+                    </Button>
                     {/* Close */}
                     <button className="icon-btn close-btn" title="Close" aria-label="Close">✕</button>
                 </div>
             </header>
+
+            {showRenameDialog && (
+                <div className="rename-dialog-backdrop" role="presentation">
+                    <div className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-dialog-title">
+                        <button
+                            type="button"
+                            className="rename-close"
+                            onClick={() => setShowRenameDialog(false)}
+                            aria-label="Close rename dialog"
+                        >
+                            ×
+                        </button>
+                        <h2 id="rename-dialog-title">Rename chat</h2>
+                        <p>Keep it short and recognizable</p>
+                        <input
+                            value={renameInput}
+                            onChange={event => setRenameInput(event.target.value)}
+                            onFocus={event => event.currentTarget.select()}
+                            onKeyDown={event => {
+                                if (event.key === 'Enter') handleSaveRename();
+                                if (event.key === 'Escape') setShowRenameDialog(false);
+                            }}
+                            autoFocus
+                        />
+                        <div className="rename-actions">
+                            <Button type="button" variant="ghost" className="rename-cancel" onClick={() => setShowRenameDialog(false)}>
+                                Cancel
+                            </Button>
+                            <Button type="button" className="rename-save" onClick={handleSaveRename} disabled={!renameInput.trim()}>
+                                Save
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Context / Model bar */}
             <div className="context-bar" aria-hidden="true">
@@ -472,6 +710,10 @@ export default function App(): React.ReactElement {
                 onAttachFiles={handleAttachFiles}
                 onPickFiles={handlePickFiles}
                 onRemoveAttachedFile={handleRemoveAttachedFile}
+                onCopyConversation={handleCopyConversation}
+                didCopyConversation={didCopyConversation}
+                onResubmitMessage={handleResubmitMessage}
+                onRetryAssistant={handleRetryAssistant}
             />
         </div>
     );

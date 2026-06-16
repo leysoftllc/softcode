@@ -1,5 +1,30 @@
 import React, { useRef, useEffect, useState, type DragEvent, type FormEvent, type KeyboardEvent } from 'react';
+import {
+    Check,
+    ChevronDown,
+    ChevronRight,
+    Copy,
+    Hand,
+    ListChecks,
+    Monitor,
+    Paperclip,
+    Plus,
+    Puzzle,
+    Send,
+    Sparkles,
+    Square,
+    Target,
+} from 'lucide-react';
 import Message from './Message';
+import { Button } from './components/ui/button';
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuSeparator,
+    DropdownMenuTrigger,
+} from './components/ui/dropdown-menu';
+import { Switch } from './components/ui/switch';
 import { MODEL_INFO, type AttachedFile, type ChatMessage, type ContextInfo, type ContextScope, type ModelId, type Mode, MODE_INFO } from './types';
 
 interface Props {
@@ -18,6 +43,10 @@ interface Props {
     onAttachFiles: (files: AttachedFile[]) => void;
     onPickFiles: () => void;
     onRemoveAttachedFile: (id: string) => void;
+    onCopyConversation: () => void;
+    didCopyConversation: boolean;
+    onResubmitMessage: (messageId: string, content: string) => void;
+    onRetryAssistant: (messageId: string) => void;
 }
 
 export default function Chat({
@@ -25,12 +54,9 @@ export default function Chat({
     selectedModel, onModelChange, mode, onModeChange,
     contextScopes, onToggleContextScope,
     attachedFiles, onAttachFiles, onPickFiles, onRemoveAttachedFile,
+    onCopyConversation, didCopyConversation, onResubmitMessage, onRetryAssistant,
 }: Props): React.ReactElement {
     const [input,        setInput]       = useState('');
-    const [showModeMenu, setShowModeMenu] = useState(false);
-    const [showContextMenu, setShowContextMenu] = useState(false);
-    const [showPlusMenu, setShowPlusMenu] = useState(false);
-    const [showLocalMenu, setShowLocalMenu] = useState(false);
     const [pursueGoal, setPursueGoal] = useState(false);
     const [isDraggingImages, setIsDraggingImages] = useState(false);
     const bottomRef    = useRef<HTMLDivElement>(null);
@@ -116,7 +142,14 @@ export default function Chat({
                 )}
 
                 {messages.map(msg => (
-                    <Message key={msg.id} message={msg} />
+                    <Message
+                        key={msg.id}
+                        message={msg}
+                        onResubmit={onResubmitMessage}
+                        onRetryAssistant={onRetryAssistant}
+                        modelLabel={MODEL_INFO[selectedModel]?.label ?? selectedModel}
+                        disabled={isStreaming}
+                    />
                 ))}
 
                 <div ref={bottomRef} />
@@ -160,101 +193,98 @@ export default function Chat({
 
                     {/* ─── Toolbar: matches screenshot ─── */}
                     <div className="input-toolbar">
-                        <div className="toolbar-plus-wrap">
-                            <button
-                                type="button"
-                                className="tool-btn toolbar-attach"
-                                title="Add"
-                                onClick={() => setShowPlusMenu(v => !v)}
-                            >
-                                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                                    <path d="M8 1v14M1 8h14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
-                                </svg>
-                            </button>
-
-                            {showPlusMenu && (
-                                <div className="plus-menu" onMouseLeave={() => setShowPlusMenu(false)}>
-                                    <button
-                                        type="button"
-                                        className="plus-menu-row"
-                                        onClick={() => { onPickFiles(); setShowPlusMenu(false); }}
-                                    >
-                                        <PaperclipIcon />
-                                        <span>Add photos & files</span>
-                                    </button>
-                                    <div className="plus-menu-divider" />
-                                    <button
-                                        type="button"
-                                        className="plus-menu-row"
-                                        onClick={() => onToggleContextScope('workspace')}
-                                    >
-                                        <SparkIcon />
-                                        <span>Include IDE context</span>
-                                        <Toggle enabled={includeIdeContext} />
-                                    </button>
-                                    <button
-                                        type="button"
-                                        className="plus-menu-row"
-                                        onClick={() => onModeChange(planMode ? 'ask' : 'analyze')}
-                                    >
-                                        <PlanIcon />
-                                        <span>Plan mode</span>
-                                        <Toggle enabled={planMode} />
-                                    </button>
-                                    <button
-                                        type="button"
-                                        className="plus-menu-row"
-                                        onClick={() => setPursueGoal(v => !v)}
-                                    >
-                                        <GoalIcon />
-                                        <span>Pursue goal</span>
-                                        <Toggle enabled={pursueGoal} />
-                                    </button>
-                                    <div className="plus-menu-divider" />
-                                    <button type="button" className="plus-menu-row plus-menu-row--plugins">
-                                        <PluginIcon />
-                                        <span>Plugins</span>
-                                        <ChevronRightIcon />
-                                    </button>
-                                </div>
-                            )}
-                        </div>
+                        <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                                <Button
+                                    type="button"
+                                    variant="icon"
+                                    size="icon"
+                                    className="tool-btn toolbar-attach"
+                                    title="Add"
+                                >
+                                    <Plus size={17} strokeWidth={1.8} aria-hidden="true" />
+                                </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent className="plus-menu" align="start" side="top">
+                                <DropdownMenuItem
+                                    className="plus-menu-row"
+                                    onSelect={() => onPickFiles()}
+                                >
+                                    <Paperclip size={18} strokeWidth={1.8} aria-hidden="true" />
+                                    <span>Add photos & files</span>
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator className="plus-menu-divider" />
+                                <DropdownMenuItem
+                                    className="plus-menu-row"
+                                    onSelect={event => {
+                                        event.preventDefault();
+                                        onToggleContextScope('workspace');
+                                    }}
+                                >
+                                    <Sparkles size={18} strokeWidth={1.8} aria-hidden="true" />
+                                    <span>Include IDE context</span>
+                                    <Switch checked={includeIdeContext} aria-label="Include IDE context" />
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                    className="plus-menu-row"
+                                    onSelect={event => {
+                                        event.preventDefault();
+                                        onModeChange(planMode ? 'ask' : 'analyze');
+                                    }}
+                                >
+                                    <ListChecks size={18} strokeWidth={1.8} aria-hidden="true" />
+                                    <span>Plan mode</span>
+                                    <Switch checked={planMode} aria-label="Plan mode" />
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                    className="plus-menu-row"
+                                    onSelect={event => {
+                                        event.preventDefault();
+                                        setPursueGoal(v => !v);
+                                    }}
+                                >
+                                    <Target size={18} strokeWidth={1.8} aria-hidden="true" />
+                                    <span>Pursue goal</span>
+                                    <Switch checked={pursueGoal} aria-label="Pursue goal" />
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator className="plus-menu-divider" />
+                                <DropdownMenuItem className="plus-menu-row plus-menu-row--plugins">
+                                    <Puzzle size={18} strokeWidth={1.8} aria-hidden="true" />
+                                    <span>Plugins</span>
+                                    <ChevronRight size={17} strokeWidth={1.8} aria-hidden="true" />
+                                </DropdownMenuItem>
+                            </DropdownMenuContent>
+                        </DropdownMenu>
 
                         <div className="toolbar-divider" />
 
                         {/* Agent mode button */}
-                        <div className="toolbar-mode-wrap">
-                            <button
-                                type="button"
-                                className="toolbar-mode-btn"
-                                onClick={() => setShowModeMenu(m => !m)}
-                                title="Switch mode"
-                            >
-                                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                                    <path d="M7 14.2c-1.8-.5-2.8-1.7-2.8-3.4V8.6c0-.7.5-1.2 1.1-1.2.4 0 .8.2 1 .5V3.1c0-.7.5-1.2 1.2-1.2s1.2.5 1.2 1.2v3.4c.2-.3.6-.5 1-.5.5 0 .9.3 1.1.7.2-.2.6-.4.9-.4.6 0 1 .4 1.1.9.2-.1.5-.2.8-.2.7 0 1.2.5 1.2 1.2v1.9c0 3.2-2.5 5.1-5.3 5.1H7Z" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-                                </svg>
-                                <span>{MODE_INFO[mode].label} for approval</span>
-                                <svg width="9" height="6" viewBox="0 0 9 6" fill="none" aria-hidden="true">
-                                    <path d="M1 1.2 4.5 4.7 8 1.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                                </svg>
-                            </button>
-
-                            {showModeMenu && (
-                                <div className="mode-menu" onMouseLeave={() => setShowModeMenu(false)}>
-                                    {(Object.entries(MODE_INFO) as [Mode, typeof MODE_INFO[Mode]][]).map(([id, info]) => (
-                                        <button
-                                            key={id}
-                                            type="button"
-                                            className={`mode-menu-item ${mode === id ? 'active' : ''}`}
-                                            onClick={() => { onModeChange(id); setShowModeMenu(false); }}
-                                        >
-                                            <span className="mode-menu-label">{info.label}</span>
-                                            <span className="mode-menu-desc">{info.description}</span>
-                                        </button>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
+                        <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    className="toolbar-mode-btn"
+                                    title="Switch mode"
+                                >
+                                    <Hand size={15} strokeWidth={1.7} aria-hidden="true" />
+                                    <span>{MODE_INFO[mode].label} for approval</span>
+                                    <ChevronDown size={14} strokeWidth={1.7} aria-hidden="true" />
+                                </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent className="mode-menu" align="start" side="top">
+                                {(Object.entries(MODE_INFO) as [Mode, typeof MODE_INFO[Mode]][]).map(([id, info]) => (
+                                    <DropdownMenuItem
+                                        key={id}
+                                        className={`mode-menu-item ${mode === id ? 'active' : ''}`}
+                                        onSelect={() => onModeChange(id)}
+                                    >
+                                        <span className="mode-menu-label">{info.label}</span>
+                                        <span className="mode-menu-desc">{info.description}</span>
+                                    </DropdownMenuItem>
+                                ))}
+                            </DropdownMenuContent>
+                        </DropdownMenu>
 
                         <div className="toolbar-divider" />
 
@@ -280,81 +310,80 @@ export default function Chat({
                         {/* Spacer */}
                         <div style={{ flex: 1 }} />
 
-                        <div className="toolbar-context-wrap">
-                            <button
-                                type="button"
-                                className="ide-context-btn"
-                                title="IDE context"
-                                onClick={() => setShowContextMenu(v => !v)}
-                            >
-                                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                                    <path d="M8 1.5v2.2M8 12.3v2.2M1.5 8h2.2M12.3 8h2.2M3.4 3.4 5 5M11 11l1.6 1.6M12.6 3.4 11 5M3.4 12.6 5 11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
-                                    <path d="m7.2 6.2 2.3 1-1.3.8 1.1 1.8-1.1.6-1-1.8-1.2.9 1.2-3.3Z" fill="currentColor"/>
-                                </svg>
-                                <span>{contextScopes.length} sources</span>
-                            </button>
-                            {showContextMenu && (
-                                <div className="context-menu" onMouseLeave={() => setShowContextMenu(false)}>
-                                    {CONTEXT_OPTIONS.map(option => (
-                                        <button
+                        <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    className="ide-context-btn"
+                                    title="IDE context"
+                                >
+                                    <Sparkles size={15} strokeWidth={1.7} aria-hidden="true" />
+                                    <span>{contextScopes.length} sources</span>
+                                </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent className="context-menu" align="end" side="top">
+                                {CONTEXT_OPTIONS.map(option => {
+                                    const selected = contextScopes.includes(option.id);
+                                    return (
+                                        <DropdownMenuItem
                                             key={option.id}
-                                            type="button"
-                                            className={`context-menu-item ${contextScopes.includes(option.id) ? 'active' : ''}`}
-                                            onClick={() => onToggleContextScope(option.id)}
+                                            className={`context-menu-item ${selected ? 'active' : ''}`}
+                                            onSelect={event => {
+                                                event.preventDefault();
+                                                onToggleContextScope(option.id);
+                                            }}
                                         >
-                                            <span className="context-check">{contextScopes.includes(option.id) ? '✓' : ''}</span>
+                                            <span className="context-check">{selected && <Check size={13} strokeWidth={2} />}</span>
                                             <span>{option.label}</span>
-                                        </button>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
+                                        </DropdownMenuItem>
+                                    );
+                                })}
+                            </DropdownMenuContent>
+                        </DropdownMenu>
 
                         {/* Send / Stop */}
                         {isStreaming ? (
-                            <button
+                            <Button
                                 type="button"
+                                variant="icon"
+                                size="icon"
                                 className="send-btn send-btn--stop"
                                 onClick={onStop}
                                 title="Stop generation"
                             >
-                                <svg width="11" height="11" viewBox="0 0 11 11" fill="currentColor">
-                                    <rect x="1" y="1" width="9" height="9" rx="1"/>
-                                </svg>
-                            </button>
+                                <Square size={12} fill="currentColor" strokeWidth={0} aria-hidden="true" />
+                            </Button>
                         ) : (
-                            <button
+                            <Button
                                 type="submit"
+                                variant="icon"
+                                size="icon"
                                 className="send-btn"
                                 disabled={!input.trim()}
                                 title="Send (Enter)"
                             >
-                                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                                    <path d="M6 10.2V2M2.4 5.6 6 2l3.6 3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
-                                </svg>
-                            </button>
+                                <Send size={15} strokeWidth={1.8} aria-hidden="true" />
+                            </Button>
                         )}
                     </div>
                 </div>
             </form>
 
             <div className="chat-footer">
-                <button
-                    type="button"
-                    className="work-local-btn"
-                    onClick={() => setShowLocalMenu(v => !v)}
-                    aria-expanded={showLocalMenu}
-                >
-                    <svg width="15" height="13" viewBox="0 0 15 13" fill="none" aria-hidden="true">
-                        <path d="M2.1 2.1h10.8v7.2H2.1zM5.2 11h4.6M1 11h13" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                    <span>Work locally</span>
-                    <svg width="9" height="6" viewBox="0 0 9 6" fill="none" aria-hidden="true">
-                        <path d="M1 1.2 4.5 4.7 8 1.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                </button>
-                {showLocalMenu && (
-                    <div className="local-menu" onMouseLeave={() => setShowLocalMenu(false)}>
+                <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            className="work-local-btn"
+                        >
+                            <Monitor size={15} strokeWidth={1.7} aria-hidden="true" />
+                            <span>Work locally</span>
+                            <ChevronDown size={14} strokeWidth={1.7} aria-hidden="true" />
+                        </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent className="local-menu" align="start" side="top">
                         <div className="local-menu-title">Local workspace</div>
                         <div className="local-menu-row">
                             <span>Files are read from VS Code</span>
@@ -368,8 +397,22 @@ export default function Chat({
                             <span>Model provider</span>
                             <span>Anthropic</span>
                         </div>
-                    </div>
-                )}
+                    </DropdownMenuContent>
+                </DropdownMenu>
+                <Button
+                    type="button"
+                    variant="ghost"
+                    className={`copy-conversation-btn ${didCopyConversation ? 'copied' : ''}`}
+                    onClick={onCopyConversation}
+                    disabled={messages.length === 0}
+                    title={didCopyConversation ? 'Copied conversation' : 'Copy conversation'}
+                    aria-label={didCopyConversation ? 'Copied conversation' : 'Copy conversation'}
+                >
+                    {didCopyConversation
+                        ? <Check size={15} strokeWidth={1.9} aria-hidden="true" />
+                        : <Copy size={15} strokeWidth={1.7} aria-hidden="true" />}
+                    <span>{didCopyConversation ? 'Copied' : 'Copy conversation'}</span>
+                </Button>
             </div>
         </div>
     );
@@ -418,66 +461,6 @@ const CONTEXT_OPTIONS: Array<{ id: ContextScope; label: string }> = [
     { id: 'workspace', label: 'Workspace' },
     { id: 'search',    label: 'Search' },
 ];
-
-function Toggle({ enabled }: { enabled: boolean }): React.ReactElement {
-    return (
-        <span className={`plus-toggle ${enabled ? 'plus-toggle--on' : ''}`} aria-hidden="true">
-            <span />
-        </span>
-    );
-}
-
-function PaperclipIcon(): React.ReactElement {
-    return (
-        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M8.8 12.5v4.3a3.2 3.2 0 0 0 6.4 0V7.6a4.4 4.4 0 0 0-8.8 0v9.1a5.6 5.6 0 1 0 11.2 0V8.1" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-        </svg>
-    );
-}
-
-function SparkIcon(): React.ReactElement {
-    return (
-        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1M15.9 15.9 18 18M18 6l-2.1 2.1M8.1 15.9 6 18" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/>
-            <path d="m10.2 10 4.5 1.8-2.3 1.2 1.8 3.1-1.8 1-1.7-3.2-2 1.6L10.2 10Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
-        </svg>
-    );
-}
-
-function PlanIcon(): React.ReactElement {
-    return (
-        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M4.5 7.5 6.2 9 9 5.5M4.5 16.5 6.2 18 9 14.5M12 7h7M12 17h7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-        </svg>
-    );
-}
-
-function GoalIcon(): React.ReactElement {
-    return (
-        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.7"/>
-            <circle cx="12" cy="12" r="4.3" stroke="currentColor" strokeWidth="1.7"/>
-            <path d="M12 8.2v3.8l2.6 1.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/>
-        </svg>
-    );
-}
-
-function PluginIcon(): React.ReactElement {
-    return (
-        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M8.2 8.2a6.5 6.5 0 1 1-1.6 6.6M8.2 8.2H5.4M8.2 8.2v-3M8.2 15.8a4.7 4.7 0 0 0 7.6-3.7" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/>
-        </svg>
-    );
-}
-
-function ChevronRightIcon(): React.ReactElement {
-    return (
-        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-            <path d="m7 4.5 4.5 4.5L7 13.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-        </svg>
-    );
-}
-
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function _DeprecatedChat({ messages, isStreaming, onSend, contextInfo, selectedModel, onModelChange }: Props): React.ReactElement {

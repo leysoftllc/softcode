@@ -1,8 +1,14 @@
 import React, { useState, type ReactNode } from 'react';
+import { Check, Copy, RefreshCcw, ThumbsDown } from 'lucide-react';
+import { Button } from './components/ui/button';
 import { type ChatMessage, type EditEvent, type PlanTodo, vscode } from './types';
 
 interface Props {
     message: ChatMessage;
+    onResubmit?: (messageId: string, content: string) => void;
+    onRetryAssistant?: (messageId: string) => void;
+    modelLabel?: string;
+    disabled?: boolean;
 }
 
 // Sends a file path to the extension host to open in VS Code editor
@@ -10,8 +16,39 @@ function openFile(filePath: string): void {
     vscode.postMessage({ type: 'openFile', path: filePath });
 }
 
-export default function Message({ message }: Props): React.ReactElement {
+export default function Message({ message, onResubmit, onRetryAssistant, modelLabel, disabled = false }: Props): React.ReactElement {
     const isAI = message.role === 'assistant';
+    const renderedContent = visibleContent(message.content, Boolean(message.editEvents?.length));
+    const [isEditing, setIsEditing] = useState(false);
+    const [draft, setDraft] = useState(message.content);
+    const [copied, setCopied] = useState(false);
+    const [disliked, setDisliked] = useState(false);
+
+    const startEditing = () => {
+        setDraft(message.content);
+        setIsEditing(true);
+    };
+
+    const cancelEditing = () => {
+        setDraft(message.content);
+        setIsEditing(false);
+    };
+
+    const submitEdit = () => {
+        const trimmed = draft.trim();
+        if (!trimmed || disabled) return;
+        setIsEditing(false);
+        onResubmit?.(message.id, trimmed);
+    };
+
+    const copyMessage = () => {
+        const text = message.content.trim();
+        if (!text) return;
+        void navigator.clipboard.writeText(text).then(() => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1400);
+        });
+    };
 
     return (
         <div className={`message message-${message.role}`}>
@@ -21,11 +58,28 @@ export default function Message({ message }: Props): React.ReactElement {
                     {isAI ? '⚡' : ''}
                 </div>
                 <span className="msg-author">{isAI ? 'SoftCode AI' : 'You'}</span>
+                {!isAI && onResubmit && !isEditing && (
+                    <button
+                        type="button"
+                        className="message-edit-btn"
+                        onClick={startEditing}
+                        disabled={disabled}
+                        title="Edit and resubmit"
+                    >
+                        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <path d="m3.4 11.8-.4 1.9 1.9-.4 7.1-7.1a1.5 1.5 0 0 0-2.1-2.1l-7.1 7.1Z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                    </button>
+                )}
             </div>
 
             {/* Execution plan (todo list) */}
             {message.plan && message.plan.length > 0 && (
                 <PlanPanel todos={message.plan} />
+            )}
+
+            {isAI && (message.statuses?.length || message.plan?.length || message.editEvents?.length) && (
+                <WorkSummary message={message} />
             )}
 
             {/* Agent thinking log */}
@@ -50,15 +104,40 @@ export default function Message({ message }: Props): React.ReactElement {
             )}
 
             {/* Main content */}
-            {(visibleContent(message.content) || message.isStreaming) && (
+            {isEditing && (
+                <div className="message-edit-form">
+                    <textarea
+                        className="message-edit-textarea"
+                        value={draft}
+                        onChange={event => setDraft(event.target.value)}
+                        rows={Math.min(8, Math.max(3, draft.split('\n').length))}
+                        autoFocus
+                    />
+                    <div className="message-edit-actions">
+                        <button type="button" className="message-edit-cancel" onClick={cancelEditing}>
+                            Cancel
+                        </button>
+                        <button
+                            type="button"
+                            className="message-edit-submit"
+                            onClick={submitEdit}
+                            disabled={disabled || !draft.trim()}
+                        >
+                            Resubmit
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {!isEditing && (renderedContent || message.isStreaming) && (
                 <div className="message-body">
-                    {visibleContent(message.content) && (
+                    {renderedContent && (
                         <div className="message-content">
-                            <ContentRenderer content={visibleContent(message.content)} />
+                            <ContentRenderer content={renderedContent} />
                         </div>
                     )}
-                    {message.isStreaming && !visibleContent(message.content) && <span className="cursor">▊</span>}
-                    {message.isStreaming && visibleContent(message.content)  && <span className="cursor"> ▊</span>}
+                    {message.isStreaming && !renderedContent && <span className="cursor">▊</span>}
+                    {message.isStreaming && renderedContent  && <span className="cursor"> ▊</span>}
                 </div>
             )}
 
@@ -111,13 +190,86 @@ export default function Message({ message }: Props): React.ReactElement {
                     )}
                 </div>
             )}
+
+            {isAI && (
+                <div className="response-footer">
+                    <div className="response-footer-actions">
+                        <Button
+                            type="button"
+                            variant="icon"
+                            size="icon"
+                            className="response-action-btn"
+                            onClick={() => onRetryAssistant?.(message.id)}
+                            disabled={disabled}
+                            title="Retry response"
+                            aria-label="Retry response"
+                        >
+                            <RefreshCcw size={15} strokeWidth={1.7} aria-hidden="true" />
+                        </Button>
+                        <Button
+                            type="button"
+                            variant="icon"
+                            size="icon"
+                            className={`response-action-btn ${copied ? 'active' : ''}`}
+                            onClick={copyMessage}
+                            disabled={!message.content.trim()}
+                            title={copied ? 'Copied response' : 'Copy response'}
+                            aria-label={copied ? 'Copied response' : 'Copy response'}
+                        >
+                            {copied
+                                ? <Check size={15} strokeWidth={1.8} aria-hidden="true" />
+                                : <Copy size={15} strokeWidth={1.7} aria-hidden="true" />}
+                        </Button>
+                        <Button
+                            type="button"
+                            variant="icon"
+                            size="icon"
+                            className={`response-action-btn ${disliked ? 'active' : ''}`}
+                            onClick={() => setDisliked(value => !value)}
+                            title="Mark as unhelpful"
+                            aria-label="Mark as unhelpful"
+                        >
+                            <ThumbsDown size={15} strokeWidth={1.7} aria-hidden="true" />
+                        </Button>
+                    </div>
+                    {modelLabel && <span className="response-model">{modelLabel}</span>}
+                </div>
+            )}
         </div>
     );
 }
 
-function visibleContent(content: string): string {
-    return content
+function WorkSummary({ message }: { message: ChatMessage }): React.ReactElement {
+    const [open, setOpen] = useState(false);
+    const steps = [
+        ...(message.statuses ?? []),
+        ...(message.plan ?? []).map(todo => `${todo.status}: ${todo.text}`),
+        ...(message.editEvents ?? []).map(event => `${event.status}: ${event.file}`),
+    ];
+
+    return (
+        <div className="work-summary">
+            <button type="button" className="work-summary-toggle" onClick={() => setOpen(value => !value)}>
+                <span>{steps.length > 0 ? `Worked through ${steps.length} steps` : 'Worked on response'}</span>
+                <span className={`work-summary-chevron ${open ? 'open' : ''}`}>›</span>
+            </button>
+            {open && steps.length > 0 && (
+                <div className="work-summary-list">
+                    {steps.map((step, index) => (
+                        <div key={`${step}-${index}`}>{step}</div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function visibleContent(content: string, hasEditEvents: boolean): string {
+    const withoutMarkedEdits = content
         .replace(/```[\w.-]*\n\/\/ @@softcode-edit:\s*.+?\n[\s\S]*?```/g, '')
+        .replace(/```[^\n`]*(?:^|\s)[\w./-]+\.\w{1,8}\s*\n?[\s\S]*?```/g, '');
+
+    return (hasEditEvents ? withoutMarkedEdits.replace(/```[\s\S]*?```/g, '') : withoutMarkedEdits)
         .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
