@@ -20,10 +20,22 @@ const CONTEXT_SCOPES: { id: ContextScope; label: string }[] = [
     { id: 'search',    label: '🔍 Search'     },
 ];
 
+function formatHistoryAge(timestamp: number): string {
+    const elapsedMs = Math.max(0, Date.now() - timestamp);
+    const minutes = Math.max(1, Math.floor(elapsedMs / 60000));
+
+    if (minutes < 60) return `${minutes}m`;
+
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h`;
+
+    return `${Math.floor(hours / 24)}d`;
+}
+
 export default function App(): React.ReactElement {
     const [messages,       setMessages]       = useState<ChatMessage[]>([]);
     const [isStreaming,    setIsStreaming]     = useState(false);
-    const [selectedModel,  setSelectedModel]  = useState<ModelId>('claude-sonnet-4-5');
+    const [selectedModel,  setSelectedModel]  = useState<ModelId>('claude-sonnet-4-6');
     const [mode,           setMode]           = useState<Mode>('ask');
     const [contextScopes,  setContextScopes]  = useState<ContextScope[]>(['file', 'workspace']);
     const [showSettings,   setShowSettings]   = useState(false);
@@ -127,6 +139,18 @@ export default function App(): React.ReactElement {
                     break;
                 }
 
+                case 'streamStopped': {
+                    const msgId = String(msg['msgId']);
+                    setIsStreaming(false);
+                    setStreamingMsgId(null);
+                    setMessages(prev => prev.map(m =>
+                        m.id === msgId
+                            ? { ...m, isStreaming: false, statuses: [...(m.statuses ?? []), 'Stopped by user'] }
+                            : m,
+                    ));
+                    break;
+                }
+
                 case 'error': {
                     setIsStreaming(false);
                     setStreamingMsgId(null);
@@ -153,8 +177,14 @@ export default function App(): React.ReactElement {
 
                 case 'sessionLoaded': {
                     const s = msg['session'] as { messages: ChatMessage[] };
-                    setMessages(s.messages ?? []);
-                    setLiveContext(null);
+                    const loadedMessages = s.messages ?? [];
+                    const lastContext = [...loadedMessages]
+                        .reverse()
+                        .find(m => m.contextInfo)?.contextInfo ?? null;
+                    setMessages(loadedMessages.map(m => ({ ...m, isStreaming: false })));
+                    setLiveContext(lastContext);
+                    setIsStreaming(false);
+                    setStreamingMsgId(null);
                     setShowHistory(false);
                     break;
                 }
@@ -203,6 +233,11 @@ export default function App(): React.ReactElement {
         vscode.postMessage({ type: 'newSession' });
     }, []);
 
+    const handleStop = useCallback(() => {
+        if (!streamingMsgId) return;
+        vscode.postMessage({ type: 'stop', msgId: streamingMsgId });
+    }, [streamingMsgId]);
+
     const handleModelChange = useCallback((m: ModelId) => {
         setSelectedModel(m);
         vscode.postMessage({ type: 'setModel', model: m });
@@ -233,7 +268,7 @@ export default function App(): React.ReactElement {
     }, []);
 
     return (
-        <div className="app">
+        <div className={`app ${showHistory ? 'app--history-open' : ''}`}>
             {/* Header */}
             <header className="app-header">
                 <div className="header-title">Copilot Chat</div>
@@ -245,8 +280,8 @@ export default function App(): React.ReactElement {
                         aria-label="Chat history"
                         onClick={() => { setShowHistory(h => !h); setShowSettings(false); }}
                     >
-                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 13A6 6 0 1 1 8 2a6 6 0 0 1 0 12zm.5-9v3.25l2.5 1.5-.5.87L8 8.5V5H8.5z"/>
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M3.4 5.4A5.2 5.2 0 1 1 3 10.2M3.4 5.4H1.2M3.4 5.4V3.2" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round"/>
                         </svg>
                     </button>
                     {/* Settings */}
@@ -257,8 +292,9 @@ export default function App(): React.ReactElement {
                     </button>
                     {/* Clear / New chat */}
                     <button className="icon-btn" onClick={handleClear} title="New chat" aria-label="New chat">
-                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                            <path d="M14.5 1h-13l-.5.5v10l.5.5H7v1.293l-1.146-1.147-.708.708 2 2 .354.353.354-.353 2-2-.708-.708L9 14.293V12h5.5l.5-.5v-10l-.5-.5zM14 11H2V2h12v9z"/>
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M8.8 3H3.4A1.4 1.4 0 0 0 2 4.4v8.2A1.4 1.4 0 0 0 3.4 14h8.2a1.4 1.4 0 0 0 1.4-1.4V7.2" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round"/>
+                            <path d="M11.3 2.3a1.35 1.35 0 0 1 1.9 1.9L7.6 9.8 5 10.5l.7-2.6 5.6-5.6Z" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round"/>
                         </svg>
                     </button>
                     {/* Close */}
@@ -267,7 +303,7 @@ export default function App(): React.ReactElement {
             </header>
 
             {/* Context / Model bar */}
-            <div className="context-bar">
+            <div className="context-bar" aria-hidden="true">
                 <div className="context-left">
                     <select
                         className="model-pill"
@@ -339,8 +375,7 @@ export default function App(): React.ReactElement {
             {showHistory && (
                 <div className="history-panel">
                     <div className="history-header">
-                        <span className="history-title">Chat History</span>
-                        <button className="icon-btn" onClick={() => setShowHistory(false)}>✕</button>
+                        <span className="history-title">Tasks</span>
                     </div>
                     {sessions.length === 0 ? (
                         <div className="history-empty">No saved sessions yet</div>
@@ -355,13 +390,8 @@ export default function App(): React.ReactElement {
                                     >
                                         <span className="history-item-title">{s.title}</span>
                                         <span className="history-item-date">
-                                            {new Date(s.timestamp).toLocaleDateString(undefined, {
-                                                month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-                                            })}
+                                            {formatHistoryAge(s.timestamp)}
                                         </span>
-                                        {s.preview && (
-                                            <span className="history-item-preview">{s.preview}</span>
-                                        )}
                                     </button>
                                     <button
                                         className="history-delete-btn"
@@ -380,12 +410,14 @@ export default function App(): React.ReactElement {
                 messages={messages}
                 isStreaming={isStreaming}
                 onSend={handleSend}
-                onStop={() => setIsStreaming(false)}
                 contextInfo={liveContext}
                 selectedModel={selectedModel}
                 onModelChange={handleModelChange}
                 mode={mode}
                 onModeChange={setMode}
+                onStop={handleStop}
+                contextScopes={contextScopes}
+                onToggleContextScope={toggleScope}
             />
         </div>
     );

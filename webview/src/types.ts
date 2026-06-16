@@ -1,4 +1,4 @@
-export type ModelId = 'claude-haiku-4-5' | 'claude-sonnet-4-5' | 'claude-opus-4-5';
+export type ModelId = 'claude-haiku-4-5' | 'claude-sonnet-4-6' | 'claude-opus-4-8';
 export type Mode = 'ask' | 'analyze' | 'edit';
 export type ContextScope = 'file' | 'selection' | 'workspace' | 'search';
 export type TodoStatus = 'not-started' | 'in-progress' | 'completed';
@@ -10,9 +10,9 @@ export interface PlanTodo {
 }
 
 export const MODEL_INFO: Record<ModelId, { label: string; description: string; icon: string }> = {
-    'claude-haiku-4-5':  { label: 'Haiku 3.5', icon: '⚡', description: 'Fast'     },
-    'claude-sonnet-4-5': { label: 'Sonnet 4',  icon: '🧠', description: 'Balanced' },
-    'claude-opus-4-5':   { label: 'Opus 4',    icon: '🚀', description: 'Advanced' },
+    'claude-haiku-4-5':  { label: 'Haiku 4.5',  icon: 'H', description: 'Fast'     },
+    'claude-sonnet-4-6': { label: 'Sonnet 4.6', icon: 'S', description: 'Balanced' },
+    'claude-opus-4-8':   { label: 'Opus 4.8',   icon: 'O', description: 'Advanced' },
 };
 
 export interface MessageAction {
@@ -66,10 +66,26 @@ export interface SessionMeta {
 }
 
 // VS Code Webview API injected at runtime
+declare global {
+    interface Window {
+        acquireVsCodeApi?: () => {
+            postMessage(message: unknown): void;
+            getState():          unknown;
+            setState(state: unknown): void;
+        };
+    }
+}
+
 declare function acquireVsCodeApi(): {
     postMessage(message: unknown): void;
     getState():          unknown;
     setState(state: unknown): void;
 };
 
-export const vscode = acquireVsCodeApi();
+export const vscode = typeof window.acquireVsCodeApi === 'function'
+    ? window.acquireVsCodeApi()
+    : {
+        postMessage: () => undefined,
+        getState:    () => undefined,
+        setState:    () => undefined,
+    };

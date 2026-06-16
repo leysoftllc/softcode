@@ -26,25 +26,32 @@ export class SessionManager {
         return this.all().find(s => s.id === id);
     }
 
-    save(session: SavedSession): void {
+    async save(session: SavedSession): Promise<void> {
         const sessions = this.all().filter(s => s.id !== session.id);
         sessions.unshift(session);
         if (sessions.length > MAX_SESSIONS) sessions.splice(MAX_SESSIONS);
-        void this.ctx.globalState.update(SESSIONS_KEY, sessions);
-        void this.ctx.globalState.update(CURRENT_KEY, session.id);
+        await this.ctx.globalState.update(SESSIONS_KEY, sessions);
+        await this.ctx.globalState.update(CURRENT_KEY, session.id);
     }
 
-    delete(id: string): void {
+    async delete(id: string): Promise<void> {
         const sessions = this.all().filter(s => s.id !== id);
-        void this.ctx.globalState.update(SESSIONS_KEY, sessions);
+        await this.ctx.globalState.update(SESSIONS_KEY, sessions);
+        if (this.getCurrentId() === id) {
+            await this.ctx.globalState.update(CURRENT_KEY, sessions[0]?.id);
+        }
     }
 
     getCurrentId(): string | undefined {
         return this.ctx.globalState.get<string>(CURRENT_KEY);
     }
 
-    setCurrentId(id: string): void {
-        void this.ctx.globalState.update(CURRENT_KEY, id);
+    async setCurrentId(id: string): Promise<void> {
+        await this.ctx.globalState.update(CURRENT_KEY, id);
+    }
+
+    async clearCurrentId(): Promise<void> {
+        await this.ctx.globalState.update(CURRENT_KEY, undefined);
     }
 
     private all(): SavedSession[] {

@@ -32,6 +32,7 @@ export class ClaudeClient {
         messages: ConversationMessage[],
         callbacks: StreamCallbacks,
         maxTokens = 4096,
+        signal?: AbortSignal,
     ): Promise<void> {
         if (!this.client) {
             callbacks.onError(
@@ -46,7 +47,7 @@ export class ClaudeClient {
                 max_tokens: maxTokens,
                 system,
                 messages: messages.map(m => ({ role: m.role, content: m.content })),
-            });
+            }, { signal });
 
             for await (const chunk of stream) {
                 if (
@@ -63,6 +64,9 @@ export class ClaudeClient {
                 final.usage.output_tokens,
             );
         } catch (err: unknown) {
+            if (signal?.aborted) {
+                return;
+            }
             const message =
                 err instanceof Error ? err.message : 'Unknown error communicating with Claude API';
             callbacks.onError(message);

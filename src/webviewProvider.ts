@@ -5,7 +5,6 @@ import { ClaudeClient, ModelId } from './claudeClient';
 import { ContextBuilder, ConversationMessage, RequestContext, Mode } from './contextBuilder';
 import { WorkspaceIndexer } from './workspaceIndexer';
 import { UsageTracker } from './usageTracker';
-import { PatchManager } from './patchManager';
 import { SessionManager, SavedSession } from './sessionManager';
 
 type ContextScope = 'file' | 'selection' | 'workspace' | 'search';
@@ -18,12 +17,13 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
     private readonly claudeClient   = new ClaudeClient();
     private readonly indexer        = new WorkspaceIndexer();
     private readonly contextBuilder = new ContextBuilder(this.indexer);
-    private readonly patchManager   = new PatchManager();
     private readonly sessionManager: SessionManager;
 
     private conversationHistory: ConversationMessage[] = [];
-    private currentModel: ModelId = 'claude-sonnet-4-5';
+    private currentModel: ModelId = 'claude-sonnet-4-6';
     private currentSessionId: string = `s-${Date.now()}`;
+    private activeStream?: { msgId: string; controller: AbortController };
+    private hasCompletedTurnPendingSave = false;
     // serialised messages kept in sync for session save
     private currentMessages: unknown[] = [];
 
@@ -59,6 +59,8 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             this.context.subscriptions,
         );
 
+        const restored = this.restoreCurrentSession();
+
         // Push session list to webview once it's ready
         webviewView.onDidChangeVisibility(() => {
             if (webviewView.visible) {
@@ -66,6 +68,9 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             }
         });
         this.post({ type: 'sessions', list: this.sessionManager.list() });
+        if (restored) {
+            this.post({ type: 'sessionLoaded', session: restored });
+        }
     }
 
     // ─── Message handler ────────────────────────────────────────────────────
@@ -83,8 +88,14 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 );
                 break;
 
+            case 'stop':
+                this.stopActiveStream(String(msg['msgId'] ?? ''));
+                break;
+
             case 'clear':
                 this.conversationHistory = [];
+                this.currentMessages = [];
+                this.hasCompletedTurnPendingSave = false;
                 break;
 
             case 'setModel':
@@ -121,13 +132,22 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                     this.currentSessionId   = session.id;
                     this.currentMessages    = session.messages;
                     this.conversationHistory = session.history as ConversationMessage[];
+                    this.hasCompletedTurnPendingSave = false;
+                    await this.sessionManager.setCurrentId(session.id);
                     this.post({ type: 'sessionLoaded', session });
+                    this.post({ type: 'sessions', list: this.sessionManager.list() });
                 }
                 break;
             }
 
             case 'deleteSession': {
-                this.sessionManager.delete(String(msg['id']));
+                const id = String(msg['id']);
+                const wasCurrent = id === this.currentSessionId;
+                await this.sessionManager.delete(id);
+                if (wasCurrent) {
+                    const next = this.restoreCurrentSession();
+                    this.post({ type: 'sessionLoaded', session: next ?? { messages: [] } });
+                }
                 this.post({ type: 'sessions', list: this.sessionManager.list() });
                 break;
             }
@@ -136,12 +156,22 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 this.currentSessionId    = `s-${Date.now()}`;
                 this.currentMessages     = [];
                 this.conversationHistory = [];
+                this.hasCompletedTurnPendingSave = false;
+                await this.sessionManager.clearCurrentId();
                 this.post({ type: 'sessions', list: this.sessionManager.list() });
                 break;
 
             // Webview syncs its messages array so we can persist them
             case 'syncMessages':
                 this.currentMessages = (msg['messages'] as unknown[]) ?? [];
+                if (
+                    this.hasCompletedTurnPendingSave &&
+                    this.conversationHistory.length > 0 &&
+                    !this.hasStreamingMessage(this.currentMessages)
+                ) {
+                    this.hasCompletedTurnPendingSave = false;
+                    void this.autoSaveSession();
+                }
                 break;
 
             // ── File navigation ─────────────────────────────────────────────
@@ -187,7 +217,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
 
         // Build context with live status + todo updates
         const { ctx, contextInfo } = await this.buildSmartContext(
-            content, scopes, mode, msgId, updateTodo,
+            content, model, scopes, mode, msgId, updateTodo,
         );
 
         // Send context info so the indicator updates before the stream
@@ -231,6 +261,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
      */
     private async buildSmartContext(
         message: string,
+        model: ModelId,
         scopes: ContextScope[],
         mode: Mode,
         msgId: string,
@@ -285,10 +316,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 updateTodo('search', 'in-progress');
                 status(`🔎 Searching workspace for: ${keywords.slice(0, 3).join(', ')}...`);
 
-                const [fileResults, contentResults] = await Promise.all([
-                    this.indexer.searchFiles(keywords.join(' '), 8),
-                    this.indexer.searchContent(keywords.join(' '), 6),
-                ]);
+                const [fileResults, contentResults] = await this.searchWorkspaceForKeywords(keywords);
 
                 const activePath = ctx.activeFile?.fsPath;
                 const relevant = [
@@ -352,8 +380,12 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             ctx.searchResults ?? '',
         ].join('');
         const tokens = Math.ceil(contextText.length / 4);
-        const costPer1M = model => ({ 'claude-haiku-4-5': 0.80, 'claude-sonnet-4-5': 3.00, 'claude-opus-4-5': 15.00 })[model] ?? 3.00;
-        const estimatedCost = (tokens / 1_000_000) * costPer1M(this.currentModel);
+        const INPUT_COST_PER_1M: Record<ModelId, number> = {
+            'claude-haiku-4-5': 1.00,
+            'claude-sonnet-4-6': 3.00,
+            'claude-opus-4-8': 5.00,
+        };
+        const estimatedCost = (tokens / 1_000_000) * INPUT_COST_PER_1M[model];
 
         return {
             ctx,
@@ -378,13 +410,17 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         );
 
         let fullResponse = '';
+        const controller = new AbortController();
+        this.activeStream = { msgId, controller };
 
         await this.claudeClient.streamMessage(model, system, messages, {
             onText: text => {
+                if (controller.signal.aborted) return;
                 fullResponse += text;
                 this.post({ type: 'streamChunk', msgId, text });
             },
             onComplete: (inputTokens, outputTokens) => {
+                if (controller.signal.aborted) return;
                 const record = this.usageTracker.track(model, inputTokens, outputTokens);
                 this.post({
                     type: 'streamEnd',
@@ -400,6 +436,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                     { role: 'user',      content: userMessage  },
                     { role: 'assistant', content: fullResponse },
                 );
+                this.hasCompletedTurnPendingSave = true;
                 onGenerateComplete?.();
 
                 // In edit mode, automatically apply the generated patches to disk
@@ -407,13 +444,25 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                     void this.applyEditPatches(fullResponse);
                 }
 
-                // Auto-save session after every completed turn
-                void this.autoSaveSession();
             },
             onError: error => {
+                if (controller.signal.aborted) return;
                 this.post({ type: 'error', msgId, message: error });
             },
-        });
+        }, 4096, controller.signal);
+
+        if (this.activeStream?.msgId === msgId) {
+            this.activeStream = undefined;
+        }
+    }
+
+    private stopActiveStream(msgId: string): void {
+        if (!this.activeStream) return;
+        if (msgId && this.activeStream.msgId !== msgId) return;
+        const { msgId: activeMsgId, controller } = this.activeStream;
+        controller.abort();
+        this.activeStream = undefined;
+        this.post({ type: 'streamStopped', msgId: activeMsgId });
     }
 
     /**
@@ -444,12 +493,27 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders?.length) return;
         const rootPath = folders[0].uri.fsPath;
+        const label = edits.map(e => e.relPath).join(', ');
+        const answer = await vscode.window.showInformationMessage(
+            `SoftCode AI wants to edit ${edits.length} file${edits.length > 1 ? 's' : ''}: ${label}`,
+            { modal: true },
+            'Apply Changes',
+            'Cancel',
+        );
+
+        if (answer !== 'Apply Changes') {
+            return;
+        }
 
         const wsEdit = new vscode.WorkspaceEdit();
         const applied: string[] = [];
 
         for (const { relPath, content } of edits) {
-            const fullPath = path.join(rootPath, relPath);
+            const fullPath = this.resolveWorkspacePath(rootPath, relPath);
+            if (!fullPath) {
+                void vscode.window.showWarningMessage(`SoftCode AI: Skipped unsafe edit path "${relPath}".`);
+                continue;
+            }
             const uri = vscode.Uri.file(fullPath);
             try {
                 const doc = await vscode.workspace.openTextDocument(uri);
@@ -461,6 +525,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
                 applied.push(relPath);
             } catch {
                 // File doesn't exist yet — create it
+                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(fullPath)));
                 wsEdit.createFile(uri, { overwrite: true });
                 wsEdit.insert(uri, new vscode.Position(0, 0), content);
                 applied.push(relPath);
@@ -477,6 +542,16 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             const firstUri = vscode.Uri.file(path.join(rootPath, applied[0]));
             void vscode.window.showTextDocument(firstUri, { preserveFocus: true, preview: false });
         }
+    }
+
+    private resolveWorkspacePath(rootPath: string, relPath: string): string | undefined {
+        const normalized = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+        const fullPath = path.resolve(rootPath, normalized);
+        const relative = path.relative(rootPath, fullPath);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+            return undefined;
+        }
+        return fullPath;
     }
 
     // ─── Keyword extraction ──────────────────────────────────────────────────
@@ -497,6 +572,27 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             .slice(0, 6);
     }
 
+    private async searchWorkspaceForKeywords(
+        keywords: string[],
+    ): Promise<[Awaited<ReturnType<WorkspaceIndexer['searchFiles']>>, Awaited<ReturnType<WorkspaceIndexer['searchContent']>>]> {
+        const fileMap = new Map<string, Awaited<ReturnType<WorkspaceIndexer['searchFiles']>>[number]>();
+        const contentMap = new Map<string, Awaited<ReturnType<WorkspaceIndexer['searchContent']>>[number]>();
+
+        await Promise.all(keywords.slice(0, 5).map(async keyword => {
+            const [files, content] = await Promise.all([
+                this.indexer.searchFiles(keyword, 4),
+                this.indexer.searchContent(keyword, 4),
+            ]);
+            files.forEach(file => fileMap.set(file.fsPath, file));
+            content.forEach(file => contentMap.set(file.fsPath, file));
+        }));
+
+        return [
+            [...fileMap.values()].slice(0, 8),
+            [...contentMap.values()].slice(0, 8),
+        ];
+    }
+
     // ─── Workspace search ────────────────────────────────────────────────────
 
     private async handleSearch(query: string): Promise<void> {
@@ -513,7 +609,31 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
      * Called by the webview via 'syncMessages' to keep currentMessages up-to-date,
      * and also internally after each turn to persist the session.
      */
-    private autoSaveSession(): void {
+    private restoreCurrentSession(): SavedSession | undefined {
+        if (this.currentMessages.length > 0 || this.conversationHistory.length > 0) {
+            return undefined;
+        }
+
+        const currentId = this.sessionManager.getCurrentId();
+        const session = currentId ? this.sessionManager.load(currentId) : undefined;
+        if (!session) return undefined;
+
+        this.currentSessionId = session.id;
+        this.currentMessages = session.messages;
+        this.conversationHistory = session.history as ConversationMessage[];
+        this.hasCompletedTurnPendingSave = false;
+        return session;
+    }
+
+    private hasStreamingMessage(messages: unknown[]): boolean {
+        return messages.some(message => (
+            typeof message === 'object' &&
+            message !== null &&
+            (message as { isStreaming?: unknown }).isStreaming === true
+        ));
+    }
+
+    private async autoSaveSession(): Promise<void> {
         if (this.currentMessages.length === 0 && this.conversationHistory.length === 0) return;
 
         // Derive title from first user message
@@ -525,7 +645,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             .filter(m => m.role === 'assistant')
             .at(-1)?.content.slice(0, 80) ?? '';
 
-        const session: import('./sessionManager').SavedSession = {
+        const session: SavedSession = {
             id:        this.currentSessionId,
             title,
             timestamp: Date.now(),
@@ -533,7 +653,7 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
             messages:  this.currentMessages,
             history:   this.conversationHistory as unknown[],
         };
-        this.sessionManager.save(session);
+        await this.sessionManager.save(session);
         this.post({ type: 'sessions', list: this.sessionManager.list() });
     }
 
@@ -560,6 +680,20 @@ export class SoftCodeChatViewProvider implements vscode.WebviewViewProvider {
     public async triggerGenerateTests(): Promise<void> {
         if (!vscode.window.activeTextEditor) return;
         await this.handleChat('Generate comprehensive unit tests for this file. Use the appropriate test framework for the language.', this.currentModel, 'edit', ['file', 'workspace']);
+    }
+
+    public async triggerWorkspaceSearch(query: string): Promise<void> {
+        await this.handleChat(`Search the workspace for "${query}" and explain the most relevant files and code paths.`, this.currentModel, 'ask', ['workspace', 'search']);
+    }
+
+    public clearConversation(): void {
+        this.currentSessionId    = `s-${Date.now()}`;
+        this.currentMessages     = [];
+        this.conversationHistory = [];
+        this.hasCompletedTurnPendingSave = false;
+        void this.sessionManager.clearCurrentId();
+        this.post({ type: 'sessionLoaded', session: { messages: [] } });
+        this.post({ type: 'sessions', list: this.sessionManager.list() });
     }
 
     // ─── HTML generation ────────────────────────────────────────────────────

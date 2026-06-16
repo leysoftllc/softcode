@@ -67,13 +67,12 @@ export function activate(context: vscode.ExtensionContext): void {
             });
             if (query) {
                 await focusChat();
-                // Proxy through webview message so results appear in the chat UI
-                // The provider handles 'searchWorkspace' internally
+                await getProvider().triggerWorkspaceSearch(query);
             }
         }),
 
         vscode.commands.registerCommand('softcodeAI.clearConversation', () => {
-            // Handled in the webview; also reset via provider directly
+            getProvider().clearConversation();
         }),
 
         vscode.commands.registerCommand('softcodeAI.setApiKey', async () => {
