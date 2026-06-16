@@ -462,6 +462,13 @@ export default function App(): React.ReactElement {
         setChatTitle('New chat');
     }, []);
 
+    const handleReloadChat = useCallback(() => {
+        setShowHistory(false);
+        setShowSettings(false);
+        vscode.postMessage({ type: 'reloadSession' });
+        vscode.postMessage({ type: 'listSessions' });
+    }, []);
+
     return (
         <div className={`app ${showHistory ? 'app--history-open' : ''}`}>
             {/* Header */}
@@ -519,10 +526,10 @@ export default function App(): React.ReactElement {
                         type="button"
                         variant="icon"
                         size="icon"
-                        className={`icon-btn ${showHistory ? 'active' : ''}`}
-                        title="Chat history"
-                        aria-label="Chat history"
-                        onClick={() => { setShowHistory(h => !h); setShowSettings(false); }}
+                        className="icon-btn"
+                        title="Reload chat"
+                        aria-label="Reload chat"
+                        onClick={handleReloadChat}
                     >
                         <RotateCcw size={18} strokeWidth={1.8} aria-hidden="true" />
                     </Button>

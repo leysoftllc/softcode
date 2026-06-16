@@ -1,5 +1,5 @@
-import React, { useState, type ReactNode } from 'react';
-import { Check, Copy, RefreshCcw, ThumbsDown } from 'lucide-react';
+import React, { useRef, useState, type ReactNode } from 'react';
+import { Check, Copy, Pencil, RefreshCcw, ThumbsDown } from 'lucide-react';
 import { Button } from './components/ui/button';
 import { type ChatMessage, type EditEvent, type PlanTodo, vscode } from './types';
 
@@ -23,6 +23,8 @@ export default function Message({ message, onResubmit, onRetryAssistant, modelLa
     const [draft, setDraft] = useState(message.content);
     const [copied, setCopied] = useState(false);
     const [disliked, setDisliked] = useState(false);
+    const lastTapRef = useRef(0);
+    const canEdit = !isAI && Boolean(onResubmit) && !disabled;
 
     const startEditing = () => {
         setDraft(message.content);
@@ -39,6 +41,18 @@ export default function Message({ message, onResubmit, onRetryAssistant, modelLa
         if (!trimmed || disabled) return;
         setIsEditing(false);
         onResubmit?.(message.id, trimmed);
+    };
+
+    const handleEditPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+        if (!canEdit || event.pointerType === 'mouse') return;
+        const now = Date.now();
+        if (now - lastTapRef.current < 320) {
+            event.preventDefault();
+            lastTapRef.current = 0;
+            startEditing();
+            return;
+        }
+        lastTapRef.current = now;
     };
 
     const copyMessage = () => {
@@ -58,19 +72,6 @@ export default function Message({ message, onResubmit, onRetryAssistant, modelLa
                     {isAI ? '⚡' : ''}
                 </div>
                 <span className="msg-author">{isAI ? 'SoftCode AI' : 'You'}</span>
-                {!isAI && onResubmit && !isEditing && (
-                    <button
-                        type="button"
-                        className="message-edit-btn"
-                        onClick={startEditing}
-                        disabled={disabled}
-                        title="Edit and resubmit"
-                    >
-                        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                            <path d="m3.4 11.8-.4 1.9 1.9-.4 7.1-7.1a1.5 1.5 0 0 0-2.1-2.1l-7.1 7.1Z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                        </svg>
-                    </button>
-                )}
             </div>
 
             {/* Execution plan (todo list) */}
@@ -130,7 +131,12 @@ export default function Message({ message, onResubmit, onRetryAssistant, modelLa
             )}
 
             {!isEditing && (renderedContent || message.isStreaming) && (
-                <div className="message-body">
+                <div
+                    className="message-body"
+                    onDoubleClick={canEdit ? startEditing : undefined}
+                    onPointerUp={canEdit ? handleEditPointerUp : undefined}
+                    title={canEdit ? 'Double-click to edit' : undefined}
+                >
                     {renderedContent && (
                         <div className="message-content">
                             <ContentRenderer content={renderedContent} />
@@ -139,6 +145,20 @@ export default function Message({ message, onResubmit, onRetryAssistant, modelLa
                     {message.isStreaming && !renderedContent && <span className="cursor">▊</span>}
                     {message.isStreaming && renderedContent  && <span className="cursor"> ▊</span>}
                 </div>
+            )}
+
+            {canEdit && !isEditing && (
+                <Button
+                    type="button"
+                    variant="icon"
+                    size="icon"
+                    className="message-edit-btn"
+                    onClick={startEditing}
+                    title="Edit and resubmit"
+                    aria-label="Edit and resubmit"
+                >
+                    <Pencil size={15} strokeWidth={1.7} aria-hidden="true" />
+                </Button>
             )}
 
             {message.editEvents && message.editEvents.length > 0 && (
@@ -246,11 +266,14 @@ function WorkSummary({ message }: { message: ChatMessage }): React.ReactElement 
         ...(message.plan ?? []).map(todo => `${todo.status}: ${todo.text}`),
         ...(message.editEvents ?? []).map(event => `${event.status}: ${event.file}`),
     ];
+    const label = steps.length > 0
+        ? `${message.isStreaming ? 'Working through' : 'Finished with'} ${steps.length} ${steps.length === 1 ? 'step' : 'steps'}`
+        : message.isStreaming ? 'Working' : 'Finished';
 
     return (
         <div className="work-summary">
             <button type="button" className="work-summary-toggle" onClick={() => setOpen(value => !value)}>
-                <span>{steps.length > 0 ? `Worked through ${steps.length} steps` : 'Worked on response'}</span>
+                <span>{label}</span>
                 <span className={`work-summary-chevron ${open ? 'open' : ''}`}>›</span>
             </button>
             {open && steps.length > 0 && (

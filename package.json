@@ -13,8 +13,16 @@
     "Machine Learning",
     "Other"
   ],
-  "keywords": ["ai", "claude", "anthropic", "coding assistant", "codebase"],
-  "activationEvents": ["onStartupFinished"],
+  "keywords": [
+    "ai",
+    "claude",
+    "anthropic",
+    "coding assistant",
+    "codebase"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -141,7 +149,7 @@
     "@anthropic-ai/sdk": "^0.36.0"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^20.19.43",
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.20.0",
     "typescript": "^5.3.0"
